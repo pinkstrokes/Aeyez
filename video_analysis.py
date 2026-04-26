@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,32 @@ class DailySelection:
     baseline_target_count: int
     selected_frames: list[SelectedFrame]
     events: list[EventSegment]
+    timeline_segments: list["TimelineSegment"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TimelineSegment:
+    start_s: float
+    end_s: float
+    reason: str
+    risk_level: str
+    peak_score: float
+    event_count: int
+    danger_count: int
+    sample_interval_s: float
+    anchor_s: float
+
+
+@dataclass(frozen=True)
+class AnalysisSegment:
+    start_s: float
+    end_s: float
+    reason: str
+    risk_level: str
+    peak_score: float
+    event_count: int
+    danger_count: int
+    sample_interval_s: float
 
 
 def _jpeg_data_url(frame: Any, quality: int = 82) -> str:
@@ -144,10 +170,209 @@ def format_seconds(seconds: float) -> str:
     return _format_ts(seconds)
 
 
+def _classify_risk_level(*, danger_count: int, event_count: int, peak_score: float) -> str:
+    if danger_count > 0 or peak_score >= 18.0:
+        return "high"
+    if event_count > 0 or peak_score >= 10.0:
+        return "medium"
+    return "low"
+
+
+def _default_sample_interval_s(risk_level: str) -> float:
+    if risk_level == "high":
+        return 1.0
+    if risk_level == "uncertain":
+        return 2.0
+    if risk_level == "medium":
+        return 2.0
+    return 3.0
+
+
+def _add_uniform_segments(
+    items: list[TimelineSegment],
+    *,
+    start_s: float,
+    end_s: float,
+    reason: str,
+    risk_level: str,
+    peak_score: float,
+    event_count: int,
+    danger_count: int,
+    target_window_s: float,
+) -> None:
+    cursor = start_s
+    while cursor < end_s:
+        seg_end = min(end_s, cursor + target_window_s)
+        items.append(
+            TimelineSegment(
+                start_s=round(cursor, 3),
+                end_s=round(seg_end, 3),
+                reason=reason,
+                risk_level=risk_level,
+                peak_score=round(peak_score, 3),
+                event_count=event_count,
+                danger_count=danger_count,
+                sample_interval_s=_default_sample_interval_s(risk_level),
+                anchor_s=round((cursor + seg_end) / 2.0, 3),
+            )
+        )
+        cursor = seg_end
+
+
+def build_global_timeline(
+    selection: DailySelection,
+    *,
+    quiet_window_s: float = 30.0,
+    active_window_s: float = 30.0,
+    event_padding_s: float = 6.0,
+    max_anchors_per_minute: int = 3,
+) -> list[TimelineSegment]:
+    timeline: list[TimelineSegment] = []
+    events = sorted(selection.events, key=lambda item: item.peak_s)
+    window_start = 0.0
+
+    while window_start < selection.duration_s:
+        window_end = min(selection.duration_s, window_start + quiet_window_s)
+        window_events = [
+            event for event in events
+            if event.end_s > window_start and event.start_s < window_end
+        ]
+        ranked = sorted(
+            window_events,
+            key=lambda item: (not item.danger_candidate, -item.peak_score, item.peak_s),
+        )[:max_anchors_per_minute]
+        peak_score = max((item.peak_score for item in window_events), default=0.0)
+        danger_count = sum(1 for item in window_events if item.danger_candidate)
+        event_count = len(window_events)
+        risk_level = _classify_risk_level(
+            danger_count=danger_count,
+            event_count=event_count,
+            peak_score=peak_score,
+        )
+        reason = "global-motion-cluster" if ranked else "global-baseline"
+        anchor_s = (
+            ranked[0].peak_s if ranked else (window_start + window_end) / 2.0
+        )
+        timeline.append(
+            TimelineSegment(
+                start_s=round(window_start, 3),
+                end_s=round(window_end, 3),
+                reason=reason,
+                risk_level=risk_level,
+                peak_score=round(peak_score, 3),
+                event_count=event_count,
+                danger_count=danger_count,
+                sample_interval_s=_default_sample_interval_s(risk_level),
+                anchor_s=round(anchor_s, 3),
+            )
+        )
+        window_start = window_end
+
+    return timeline
+
+
+def _events_for_window(
+    events: list[EventSegment],
+    *,
+    start_s: float,
+    end_s: float,
+) -> list[EventSegment]:
+    return [
+        event for event in events
+        if event.peak_s >= start_s and event.peak_s < end_s
+    ]
+
+
+def local_rescan_analysis_segments(
+    video_path: str | Path,
+    selection: DailySelection,
+    segments: list[AnalysisSegment],
+    *,
+    scan_interval_s: float = 1.0,
+    change_threshold: float = 8.0,
+    danger_threshold: float = 18.0,
+    high_motion_threshold: float = 80.0,
+    medium_motion_threshold: float = 45.0,
+) -> list[AnalysisSegment]:
+    """Re-score each analysis window from its own local motion profile.
+
+    The first global event pass can merge a long camera-motion stretch into one
+    large event. This local pass prevents that one event from making every
+    30-second window look equally high risk.
+    """
+    import cv2  # type: ignore[import-not-found]
+
+    path = Path(video_path).expanduser()
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return segments
+    try:
+        rescored: list[AnalysisSegment] = []
+        for segment in segments:
+            points: list[tuple[float, float]] = []
+            prev_sig = None
+            ts = segment.start_s
+            while ts <= segment.end_s:
+                frame = _capture_at(cap, ts)
+                if frame is None:
+                    break
+                sig = _signature(frame)
+                score = _change_score(prev_sig, sig)
+                prev_sig = sig
+                if score >= change_threshold:
+                    points.append((round(ts, 3), score))
+                ts += scan_interval_s
+
+            local_peak = max((score for _ts, score in points), default=0.0)
+            local_events = _events_for_window(
+                selection.events,
+                start_s=segment.start_s,
+                end_s=segment.end_s,
+            )
+            local_danger = sum(1 for event in local_events if event.danger_candidate)
+            local_count = len(points)
+            selected_count = sum(
+                1
+                for frame in selection.selected_frames
+                if segment.start_s <= frame.timestamp_s < segment.end_s
+            )
+            if local_peak >= high_motion_threshold or (
+                local_danger > 0 and local_peak >= medium_motion_threshold
+            ):
+                risk_level = "high"
+            elif local_peak >= medium_motion_threshold or local_count >= 2:
+                risk_level = "medium"
+            elif selected_count < 2:
+                risk_level = "uncertain"
+            else:
+                risk_level = "low"
+
+            reason = (
+                "local-risk-rescan"
+                if risk_level in {"high", "medium", "uncertain"}
+                else "global-baseline"
+            )
+            rescored.append(
+                AnalysisSegment(
+                    start_s=segment.start_s,
+                    end_s=segment.end_s,
+                    reason=reason,
+                    risk_level=risk_level,
+                    peak_score=round(local_peak, 3),
+                    event_count=local_count,
+                    danger_count=local_danger,
+                    sample_interval_s=_default_sample_interval_s(risk_level),
+                )
+            )
+        return rescored
+    finally:
+        cap.release()
+
+
 def select_daily_video_frames(
     video_path: str | Path,
     *,
-    baseline_frames_per_minute: int = 5,
+    baseline_frames_per_minute: int = 8,
     scan_interval_s: float = 1.0,
     change_threshold: float = 8.0,
     danger_threshold: float = 18.0,
@@ -235,6 +460,7 @@ def select_daily_video_frames(
             baseline_target_count=baseline_target_count,
             selected_frames=selected_frames,
             events=events,
+            timeline_segments=[],
         )
     finally:
         cap.release()
@@ -277,10 +503,22 @@ def choose_segment_model_frames(
     if len(in_segment) <= max_frames:
         return in_segment
 
+    segment_events = [
+        event for event in selection.events
+        if event.end_s > start_s and event.start_s < end_s
+    ]
+    event_peaks = [event.peak_s for event in segment_events]
     priority = {"danger-candidate": 0, "event": 1, "baseline-context": 2}
     chosen: list[SelectedFrame] = []
     seen: set[float] = set()
-    for frame in sorted(in_segment, key=lambda item: (priority.get(item.reason, 9), item.timestamp_s)):
+    for frame in sorted(
+        in_segment,
+        key=lambda item: (
+            priority.get(item.reason, 9),
+            min((abs(item.timestamp_s - peak) for peak in event_peaks), default=9999.0),
+            item.timestamp_s,
+        ),
+    ):
         if frame.reason == "baseline-context" and len(chosen) >= max_frames:
             continue
         if frame.timestamp_s not in seen:
@@ -301,3 +539,145 @@ def choose_segment_model_frames(
                     chosen.append(baselines[idx])
 
     return sorted(chosen[:max_frames], key=lambda item: item.timestamp_s)
+
+
+def choose_adaptive_analysis_segments(
+    selection: DailySelection,
+    *,
+    base_window_s: float | None = None,
+    normal_segment_s: float = 30.0,
+    medium_segment_s: float = 30.0,
+    high_segment_s: float = 30.0,
+    min_segment_s: float = 30.0,
+) -> list[AnalysisSegment]:
+    _ = base_window_s
+    segments: list[AnalysisSegment] = []
+    timeline = selection.timeline_segments or build_global_timeline(selection)
+    for item in timeline:
+        segments.append(
+            AnalysisSegment(
+                start_s=round(item.start_s, 3),
+                end_s=round(item.end_s, 3),
+                reason=item.reason,
+                risk_level=item.risk_level,
+                peak_score=round(item.peak_score, 3),
+                event_count=item.event_count,
+                danger_count=item.danger_count,
+                sample_interval_s=item.sample_interval_s,
+            )
+        )
+
+    deduped: list[AnalysisSegment] = []
+    seen: set[tuple[float, float, str, str]] = set()
+    for segment in segments:
+        key = (segment.start_s, segment.end_s, segment.reason, segment.risk_level)
+        if key not in seen:
+            deduped.append(segment)
+            seen.add(key)
+    return sorted(deduped, key=lambda item: (item.start_s, item.end_s))
+
+
+def choose_timeline_model_frames(
+    selection: DailySelection,
+    *,
+    start_s: float,
+    end_s: float,
+    min_frames_per_minute: int = 6,
+    max_frames: int = 20,
+) -> list[SelectedFrame]:
+    in_segment = [
+        frame for frame in selection.selected_frames
+        if start_s <= frame.timestamp_s < end_s
+    ]
+    segment_duration = max(1.0, end_s - start_s)
+    target = max(3, int((segment_duration / 60.0) * min_frames_per_minute + 0.999))
+    target = min(max_frames, target)
+    if len(in_segment) <= target:
+        return in_segment
+
+    priority = {"danger-candidate": 0, "event": 1, "baseline-context": 2}
+    chosen: list[SelectedFrame] = []
+    for frame in sorted(in_segment, key=lambda item: (priority.get(item.reason, 9), item.timestamp_s)):
+        if len(chosen) >= target:
+            break
+        chosen.append(frame)
+    return sorted(chosen, key=lambda item: item.timestamp_s)
+
+
+def sample_analysis_segment_frames(
+    video_path: str | Path,
+    selection: DailySelection,
+    segment: AnalysisSegment,
+    *,
+    max_frames: int = 20,
+) -> list[SelectedFrame]:
+    import cv2  # type: ignore[import-not-found]
+
+    segment_duration = max(0.5, segment.end_s - segment.start_s)
+    base_timestamps: list[tuple[float, str, int]] = []
+    dense_ts = segment.start_s
+    while dense_ts < segment.end_s:
+        base_timestamps.append((round(dense_ts, 3), f"{segment.risk_level}-dense", 2))
+        dense_ts += segment.sample_interval_s
+    base_timestamps.append((round(segment.end_s, 3), f"{segment.risk_level}-dense", 2))
+
+    for frame in selection.selected_frames:
+        if segment.start_s <= frame.timestamp_s <= segment.end_s:
+            priority = 0 if frame.reason == "danger-candidate" else 1
+            base_timestamps.append((round(frame.timestamp_s, 3), frame.reason, priority))
+
+    for event in selection.events:
+        if event.end_s > segment.start_s and event.start_s < segment.end_s:
+            for ts in event.frame_timestamps_s:
+                if segment.start_s <= ts <= segment.end_s:
+                    priority = 0 if event.danger_candidate else 1
+                    reason = "danger-candidate" if event.danger_candidate else "event"
+                    base_timestamps.append((round(ts, 3), reason, priority))
+
+    deduped: list[tuple[float, str, int]] = []
+    seen: set[float] = set()
+    for ts, reason, priority in sorted(base_timestamps, key=lambda item: (item[2], item[0])):
+        if ts not in seen:
+            deduped.append((ts, reason, priority))
+            seen.add(ts)
+
+    if len(deduped) > max_frames:
+        pinned = [item for item in deduped if item[2] == 0]
+        remaining = [item for item in deduped if item[2] != 0]
+        chosen = pinned[:max_frames]
+        slots = max_frames - len(chosen)
+        if slots > 0 and remaining:
+            if len(remaining) <= slots:
+                chosen.extend(remaining)
+            else:
+                for idx in range(slots):
+                    pick = round(idx * (len(remaining) - 1) / max(1, slots - 1))
+                    chosen.append(remaining[pick])
+        deduped = sorted(chosen, key=lambda item: item[0])
+
+    path = Path(video_path).expanduser()
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return choose_timeline_model_frames(
+            selection,
+            start_s=segment.start_s,
+            end_s=segment.end_s,
+            min_frames_per_minute=6,
+            max_frames=max_frames,
+        )
+    try:
+        sampled: list[SelectedFrame] = []
+        for ts, reason, _priority in deduped:
+            frame = _capture_at(cap, ts)
+            if frame is None:
+                continue
+            sampled.append(
+                SelectedFrame(
+                    timestamp_s=ts,
+                    reason=reason,
+                    data_url=_jpeg_data_url(frame),
+                )
+            )
+        return sampled
+    finally:
+        cap.release()

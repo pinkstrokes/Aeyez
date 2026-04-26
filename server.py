@@ -32,13 +32,13 @@ import os
 import re
 import tempfile
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -51,10 +51,15 @@ import database
 import seeingeye_bridge
 from video_analysis import (
     DailySelection,
+    TimelineSegment,
+    build_global_timeline,
+    choose_adaptive_analysis_segments,
     choose_segment_model_frames,
     frame_to_runtime_payload,
     format_seconds,
     frames_to_model_payload,
+    local_rescan_analysis_segments,
+    sample_analysis_segment_frames,
     select_daily_video_frames,
 )
 
@@ -109,6 +114,25 @@ _MATCH_RADIUS_METERS = 100
 _DAILY_VIDEO_MAX_SECONDS = 30 * 60
 _DAILY_SEGMENT_SECONDS = 5 * 60
 _DAILY_SEGMENT_MAX_FRAMES = 36
+
+
+@contextmanager
+def _temporary_spaz_analysis_mode(mode: str):
+    prev_spaz = os.environ.get("SPAZ_ANALYSIS_MODE")
+    prev_seeingeye = os.environ.get("SEEINGEYE_ANALYSIS_MODE")
+    os.environ["SPAZ_ANALYSIS_MODE"] = mode
+    os.environ["SEEINGEYE_ANALYSIS_MODE"] = mode
+    try:
+        yield
+    finally:
+        if prev_spaz is None:
+            os.environ.pop("SPAZ_ANALYSIS_MODE", None)
+        else:
+            os.environ["SPAZ_ANALYSIS_MODE"] = prev_spaz
+        if prev_seeingeye is None:
+            os.environ.pop("SEEINGEYE_ANALYSIS_MODE", None)
+        else:
+            os.environ["SEEINGEYE_ANALYSIS_MODE"] = prev_seeingeye
 
 
 @asynccontextmanager
@@ -272,6 +296,86 @@ async def _final_spoken_with_k2(
     return final or None
 
 
+def _is_unhelpful_runtime_answer(text: str) -> bool:
+    cleaned = re.sub(r"[\W_]+", "", (text or "")).strip().lower()
+    if len(cleaned) < 12:
+        return True
+    lowered = (text or "").strip().lower()
+    bad_phrases = (
+        "i'll answer from the provided scene description only",
+        "i’ll answer from the provided scene description only",
+        "no calculation is needed",
+        "stub response",
+        "real model coming soon",
+        "cannot analyze",
+        "unable to analyze",
+        "no analyzable",
+    )
+    return any(phrase in lowered for phrase in bad_phrases)
+
+
+_CJK_TEXT_RE = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+
+
+def _contains_cjk_text(text: str) -> bool:
+    return bool(_CJK_TEXT_RE.search(text or ""))
+
+
+def _is_unhelpful_video_summary_text(text: str) -> bool:
+    cleaned = re.sub(r"[\W_]+", "", (text or "")).strip().lower()
+    if len(cleaned) < 12:
+        return True
+    if re.fullmatch(r"(?:option)?[abcd]", cleaned):
+        return True
+    lowered = (text or "").strip().lower()
+    bad_phrases = (
+        "multiple choice",
+        "multiple-choice",
+        "answer options",
+        "there are no answer options",
+        "option a",
+        "option b",
+        "option c",
+        "option d",
+        "i'll answer from the provided scene description only",
+        "i’ll answer from the provided scene description only",
+        "i'll answer from the scene description alone",
+        "i’ll answer from the scene description alone",
+        "scene description alone",
+        "no calculation is needed",
+        "visual-safety judgment",
+        "not a numeric problem",
+        "cannot analyze",
+        "unable to analyze",
+        "no analyzable",
+    )
+    if _contains_cjk_text(text):
+        return True
+    return any(phrase in lowered for phrase in bad_phrases)
+
+
+async def _final_spoken_with_k2_guarded(
+    model_output: str,
+    *,
+    user_text: Optional[str] = None,
+    mode: str = "visual answer",
+) -> Optional[str]:
+    for _ in range(2):
+        final = await _final_spoken_with_k2(model_output, user_text=user_text, mode=mode)
+        if final and not _is_unhelpful_runtime_answer(final):
+            return final
+    return None
+
+
+async def _run_seeingeye_frames_guarded(question: str, frames_b64: list[str]) -> str:
+    last = ""
+    for _ in range(2):
+        last = await _run_seeingeye_frames(question, frames_b64)
+        if not _is_unhelpful_runtime_answer(last):
+            return last
+    return last
+
+
 async def _complete_with_k2(prompt: str, *, max_tokens: int = 900) -> Optional[str]:
     if not _K2_API_KEY or not prompt.strip():
         return None
@@ -303,6 +407,52 @@ async def _complete_with_k2(prompt: str, *, max_tokens: int = 900) -> Optional[s
         return (data["choices"][0]["message"]["content"] or "").strip() or None
     except Exception:
         return None
+
+
+async def _repair_daily_video_segment_summary(
+    *,
+    raw_summary: str,
+    start_s: float,
+    end_s: float,
+    frame_meta: list[dict],
+) -> Optional[str]:
+    frame_lines = "\n".join(f"- {item['timestamp']} ({item['reason']})" for item in frame_meta)
+    prompt = (
+        "Rewrite this raw video-segment output into a clean English safety summary for a blind user. "
+        "Remove answer letters, benchmark/test wording, prompt leakage, and any non-English text. "
+        "Do not answer with A, B, C, or D.\n\n"
+        f"Time range: {format_seconds(start_s)} to {format_seconds(end_s)}\n"
+        f"Evidence frames:\n{frame_lines}\n\n"
+        f"Raw output:\n{raw_summary}\n\n"
+        "Output exactly this structure:\n"
+        "1. Segment action\n"
+        "2. Movement timeline\n"
+        "3. Hazard table\n"
+        "4. Route / obstruction notes\n"
+        "5. Confidence\n\n"
+        "Use a markdown table for Hazard table with columns: Time range | Scene position | Hazard type | "
+        "Why it is dangerous | Recommended next action.\n"
+        "Do not include meta commentary, reasoning process, or comments about the format."
+    )
+    fixed = (await _complete_with_k2(prompt, max_tokens=500) or "").strip()
+    if fixed and not _is_unhelpful_video_summary_text(fixed):
+        return fixed
+    return None
+
+
+async def _repair_daily_video_final_summary(final_prompt: str) -> Optional[str]:
+    fixed = (
+        await _complete_with_k2(
+            final_prompt
+            + "\n\nRewrite again in English only. Do not output answer letters, benchmark/test wording, "
+            "or prompt commentary. Keep the report readable and safety-focused.",
+            max_tokens=1200,
+        )
+        or ""
+    ).strip()
+    if fixed and not _is_unhelpful_video_summary_text(fixed):
+        return fixed
+    return None
 
 
 # ── Geolocation helpers ───────────────────────────────────────────────────────
@@ -680,7 +830,17 @@ def _safe_mode_prompt(context: str, text: Optional[str], frame_count: int) -> st
         "Action = hand pose + active object + contact target + temporal motion + scene context. "
         "Identify movable entities, predict their short-horizon motion paths, and warn when the user's "
         "route intersects a collision path, line-of-fire, pinch/crush/shear zone, falling-object zone, "
-        "or a temporary obstruction that may clear if the user waits."
+        "or a temporary obstruction that may clear if the user waits. First detect hazards, then verify "
+        "whether each one is a real threat to the user's path now or within the next few seconds. Reject "
+        "hazards that are only background context and not actually in the path envelope. Do not treat a "
+        "route as safer just because it looks more open. Low-hanging chains, straps, cables, hooks, or "
+        "suspended objects that intrude into head or shoulder height are hard no-go overhead hazards unless "
+        "they are clearly outside the path. If one side has a low dangling hazard in the path envelope, that "
+        "side loses by default unless the obstacle is clearly high enough or far enough away to avoid contact. "
+        "This overhead-intrusion rule is stronger than 'looks clearer' or 'farther from people.' If another "
+        "person is moving through a narrow route, treat that route as possibly usable after a brief wait rather "
+        "than automatically unsafe. Compare left, center, and right. State the best path now, the best path "
+        "after a short wait if different, and why."
     )
     if frame_count > 1:
         instruction += (
@@ -815,13 +975,13 @@ async def analyze_change(
     question = _change_prompt(context)
 
     try:
-        raw_response = await _run_seeingeye_frames(question, [req.frame0_b64, req.frame1_b64])
+        raw_response = await _run_seeingeye_frames_guarded(question, [req.frame0_b64, req.frame1_b64])
         success = True
     except Exception as exc:
         raw_response = _bridge_error_message(exc)
         success = False
     response = (
-        await _final_spoken_with_k2(raw_response, mode="two-frame change analysis")
+        await _final_spoken_with_k2_guarded(raw_response, mode="two-frame change analysis")
         if success
         else None
     ) or raw_response
@@ -969,7 +1129,7 @@ async def chat(
             question = _chat_prompt(context, req.text)
             try:
                 if frames:
-                    raw_response = await _run_seeingeye_frames(question, frames[:5])
+                    raw_response = await _run_seeingeye_frames_guarded(question, frames[:5])
                     model_generated = True
                 else:
                     raw_response = (
@@ -980,7 +1140,7 @@ async def chat(
                 raw_response = _bridge_error_message(exc)
 
     response = (
-        await _final_spoken_with_k2(raw_response, user_text=req.text, mode="voice question answer")
+        await _final_spoken_with_k2_guarded(raw_response, user_text=req.text, mode="voice question answer")
         if model_generated
         else None
     ) or raw_response
@@ -1044,7 +1204,7 @@ async def safe_mode(
     question = _safe_mode_prompt(context, req.text, len(frames))
     if frames:
         try:
-            raw_response = await _run_seeingeye_frames(question, frames[:5])
+            raw_response = await _run_seeingeye_frames_guarded(question, frames[:5])
             success = True
         except Exception as exc:
             raw_response = _bridge_error_message(exc)
@@ -1057,7 +1217,7 @@ async def safe_mode(
         success = False
 
     response = (
-        await _final_spoken_with_k2(raw_response, user_text=req.text, mode="safe-mode mobility guidance")
+        await _final_spoken_with_k2_guarded(raw_response, user_text=req.text, mode="safe-mode mobility guidance")
         if success
         else None
     ) or raw_response
@@ -1103,6 +1263,16 @@ class DailyVideoEventResp(BaseModel):
     frame_timestamps: list[str]
 
 
+class DailyVideoTimelineResp(BaseModel):
+    start: str
+    end: str
+    reason: str
+    risk_level: str
+    peak_score: float
+    event_count: int
+    danger_count: int
+
+
 class DailyVideoSegmentResp(BaseModel):
     start: str
     end: str
@@ -1116,6 +1286,7 @@ class DailyVideoSummaryResp(BaseModel):
     model_frame_count: int
     baseline_frames_per_minute: int
     events: list[DailyVideoEventResp]
+    timeline: list[DailyVideoTimelineResp]
     segments: list[DailyVideoSegmentResp]
     summary: str
     dangers: list[str]
@@ -1129,6 +1300,8 @@ def _daily_video_segment_prompt(
     *,
     start_s: float,
     end_s: float,
+    timeline_reason: str = "global-baseline",
+    risk_level: str = "low",
 ) -> str:
     frame_lines = "\n".join(
         f"- {item['timestamp']} ({item['reason']})" for item in frames
@@ -1136,11 +1309,39 @@ def _daily_video_segment_prompt(
     return (
         "Analyze this short slice of a camera video for a blind user. The attached frames "
         "are chronological evidence frames from this time range.\n\n"
+        "This is not a test question, benchmark item, or multiple-choice task. "
+        "Your job is to analyze the video frames themselves, using the same safety-focused mindset as safe mode: "
+        "identify what people and objects are doing, what hazards are present, how the route changes, and what the user "
+        "should do next.\n\n"
         f"Time range: {format_seconds(start_s)} to {format_seconds(end_s)}\n"
+        f"Stage-1 timeline label: {timeline_reason}\n"
+        f"Local risk level: {risk_level}\n"
         f"Evidence frames:\n{frame_lines}\n\n"
-        "Return concise bullets with: what happened, notable objects/people/motion, "
-        "hazards, exact timestamps for hazards, where in the scene the hazard appears, "
-        "and practical advice. If there is no hazard, say so."
+        "Explain the scene directly to the user in plain language. Start immediately with observed events and risks. "
+        "Do not include your own thoughts, meta commentary, reasoning process, or comments about how you are answering. "
+        "Only output information the user can directly use: observed events, hazards, route changes, and practical next actions. "
+        "Do not mention scene descriptions, calculations, benchmarks, tests, prompts, or instructions.\n\n"
+        "Write in English only. Do not output answer labels such as A, B, C, or D. "
+        "Do not mention multiple-choice options, tests, benchmarks, or prompt instructions.\n\n"
+        "Use this exact output structure:\n"
+        "0. Summary:\n"
+        "Give 1-3 plain-language sentences with the main event, the most important danger, "
+        "where that danger is, the timestamp where the user can review it, and the safest immediate action.\n\n"
+        "1. Segment action:\n"
+        "Describe what the camera wearer and nearby workers are doing in this slice.\n\n"
+        "2. Movement timeline:\n"
+        "Use short timestamped bullets in chronological order.\n\n"
+        "3. Hazard table:\n"
+        "Use a markdown table with exactly these columns: Time range | Scene position | Hazard type | "
+        "Why it is dangerous | Recommended next action.\n\n"
+        "Every hazard row must state where the danger is in the scene, such as left edge, right foreground, "
+        "center walkway, overhead, underfoot, behind the worker, or beside the block stack. "
+        "Every hazard row must also include a specific timestamp or timestamp range so the user can find and review it in the video.\n\n"
+        "4. Route / obstruction notes:\n"
+        "Explain the current path, temporary blockers, no-go zones, and what must be verified before moving.\n\n"
+        "5. Confidence:\n"
+        "Briefly separate what is certain from what is uncertain.\n\n"
+        "Do not add any introduction or conclusion outside these five sections."
     )
 
 
@@ -1161,20 +1362,51 @@ def _daily_video_final_prompt(
         )
         for event in selection.events
     ) or "- No major motion events detected by the frame selector."
+    timeline = "\n".join(
+        (
+            f"- {format_seconds(segment.start_s)}-{format_seconds(segment.end_s)} "
+            f"{segment.reason} risk={segment.risk_level} peak={segment.peak_score} "
+            f"events={segment.event_count} danger_events={segment.danger_count}"
+        )
+        for segment in selection.timeline_segments
+    ) or "- No global timeline segments were generated."
     return (
         "Create the final daily-video demo summary for a blind user. The video is at most "
         "30 minutes. Use the segment summaries and event selector metadata.\n\n"
+        "This is not a test question, benchmark item, or multiple-choice task. "
+        "Your job is to analyze the video evidence itself, using a safety-focused explanation style: "
+        "describe what people and objects are doing, what hazards are present, how the route changes over time, "
+        "and what the user should do next.\n\n"
+        "Explain the video directly to the user in plain language. Start with observed events and hazards. "
+        "Do not include your own thoughts, meta commentary, reasoning process, or comments about how you are answering. "
+        "Only output information the user can directly use: observed events, hazards, route changes, and practical next actions. "
+        "Do not mention scene descriptions, calculations, benchmarks, tests, prompts, or instructions.\n\n"
+        "Write in English only. Do not output answer labels such as A, B, C, or D. "
+        "Do not mention multiple-choice options, tests, benchmarks, or prompt instructions.\n\n"
         f"Duration: {format_seconds(selection.duration_s)}\n"
-        f"Retained-frame rule: at least 5 frames per minute, plus event and danger frames.\n"
+        f"Retained-frame rule: fixed 5 frames per minute for the global timeline, then denser local sampling around risk anchors.\n"
         f"Retained frame count: {len(selection.selected_frames)}\n\n"
         f"Event selector metadata:\n{events}\n\n"
+        f"Global timeline:\n{timeline}\n\n"
         f"Segment summaries:\n{segments}\n\n"
-        "Output exactly these sections:\n"
-        "1. Today Summary: 3-6 bullets.\n"
-        "2. Dangers: bullets with timestamp range, location in scene, risk, and advice. "
-        "If none, write 'No clear dangers detected.'\n"
-        "3. Timeline: chronological bullets with timestamps.\n"
-        "4. Confidence Notes: mention anything uncertain."
+        "Follow this exact style reference:\n"
+        "=== FINAL SUMMARY ===\n"
+        "Overall summary: <2-4 sentences explaining what happened, the most important hazards, where they are, and the safest next action.>\n\n"
+        "Danger locations:\n"
+        "- <timestamp range>: <where in the scene> - <danger> - <why it is dangerous> - <what to do / what to review>\n\n"
+        "00:00:00-00:02:00: <plain-language summary for that interval>\n"
+        "00:02:00-00:04:00: <plain-language summary for that interval>\n\n"
+        "For any interval that needs more detail, continue with exactly these five sections:\n"
+        "0. Summary\n"
+        "1. Segment action\n"
+        "2. Movement timeline\n"
+        "3. Hazard table\n"
+        "4. Route / obstruction notes\n"
+        "5. Confidence\n\n"
+        "Use a markdown table for Hazard table with columns: Time range | Scene position | Hazard type | "
+        "Why it is dangerous | Recommended next action.\n"
+        "Danger locations must always include timestamp, place in the scene, reason it is dangerous, and a review/action cue. "
+        "Do not add meta commentary, explanations about how you answered, or comments about tests, options, or reasoning."
     )
 
 
@@ -1222,35 +1454,113 @@ async def daily_video_summary(
             event_merge_gap_s=8.0,
             event_padding_s=3.0,
         )
+        selection = DailySelection(
+            duration_s=selection.duration_s,
+            fps=selection.fps,
+            baseline_interval_s=selection.baseline_interval_s,
+            baseline_target_count=selection.baseline_target_count,
+            selected_frames=selection.selected_frames,
+            events=selection.events,
+            timeline_segments=build_global_timeline(selection),
+        )
         if selection.duration_s > _DAILY_VIDEO_MAX_SECONDS:
             raise HTTPException(status_code=400, detail="Demo uploads are limited to 30 minutes.")
 
         segment_results: list[DailyVideoSegmentResp] = []
         model_frame_count = 0
-        segment_start = 0.0
-        while segment_start < selection.duration_s:
-            segment_end = min(selection.duration_s, segment_start + _DAILY_SEGMENT_SECONDS)
-            segment_frames = choose_segment_model_frames(
-                selection,
-                start_s=segment_start,
-                end_s=segment_end,
-                max_frames=_DAILY_SEGMENT_MAX_FRAMES,
-            )
+        analysis_segments = choose_adaptive_analysis_segments(
+            selection,
+            normal_segment_s=30.0,
+            medium_segment_s=30.0,
+            high_segment_s=30.0,
+            min_segment_s=30.0,
+        )
+        analysis_segments = local_rescan_analysis_segments(
+            tmp_path,
+            selection,
+            analysis_segments,
+            scan_interval_s=1.0,
+            change_threshold=8.0,
+            danger_threshold=18.0,
+        )
+        selection = DailySelection(
+            duration_s=selection.duration_s,
+            fps=selection.fps,
+            baseline_interval_s=selection.baseline_interval_s,
+            baseline_target_count=selection.baseline_target_count,
+            selected_frames=selection.selected_frames,
+            events=selection.events,
+            timeline_segments=[
+                TimelineSegment(
+                    start_s=segment.start_s,
+                    end_s=segment.end_s,
+                    reason=segment.reason,
+                    risk_level=segment.risk_level,
+                    peak_score=segment.peak_score,
+                    event_count=segment.event_count,
+                    danger_count=segment.danger_count,
+                    sample_interval_s=segment.sample_interval_s,
+                    anchor_s=round((segment.start_s + segment.end_s) / 2.0, 3),
+                )
+                for segment in analysis_segments
+            ],
+        )
+        for analysis_segment in analysis_segments:
+            segment_start = analysis_segment.start_s
+            segment_end = analysis_segment.end_s
+            if analysis_segment.risk_level == "high":
+                segment_frames = sample_analysis_segment_frames(
+                    tmp_path,
+                    selection,
+                    analysis_segment,
+                    max_frames=16,
+                )
+            elif analysis_segment.risk_level in {"medium", "uncertain"}:
+                segment_frames = sample_analysis_segment_frames(
+                    tmp_path,
+                    selection,
+                    analysis_segment,
+                    max_frames=8,
+                )
+            else:
+                segment_frames = choose_segment_model_frames(
+                    selection,
+                    start_s=segment_start,
+                    end_s=segment_end,
+                    max_frames=4,
+                )
             if not segment_frames:
-                segment_start = segment_end
                 continue
             frame_meta = frames_to_model_payload(segment_frames)
             question = _daily_video_segment_prompt(
                 frame_meta,
                 start_s=segment_start,
                 end_s=segment_end,
+                timeline_reason=analysis_segment.reason,
+                risk_level=analysis_segment.risk_level,
             )
             try:
-                result = await seeingeye_bridge.run_on_frame_payloads(
-                    question,
-                    [frame_to_runtime_payload(frame) for frame in segment_frames],
+                safety_mode = analysis_segment.risk_level in {"high", "uncertain"}
+                mode_context = (
+                    _temporary_spaz_analysis_mode("safety")
+                    if safety_mode
+                    else nullcontext()
                 )
+                with mode_context:
+                    result = await seeingeye_bridge.run_on_frame_payloads(
+                        question,
+                        [frame_to_runtime_payload(frame) for frame in segment_frames],
+                    )
                 segment_summary = result.answer.strip()
+                if _is_unhelpful_video_summary_text(segment_summary):
+                    repaired = await _repair_daily_video_segment_summary(
+                        raw_summary=segment_summary,
+                        start_s=segment_start,
+                        end_s=segment_end,
+                        frame_meta=frame_meta,
+                    )
+                    if repaired:
+                        segment_summary = repaired
             except Exception as exc:
                 segment_summary = _bridge_error_message(exc)
             model_frame_count += len(segment_frames)
@@ -1262,13 +1572,14 @@ async def daily_video_summary(
                     summary=segment_summary,
                 )
             )
-            segment_start = segment_end
 
         final_prompt = _daily_video_final_prompt(
             selection=selection,
             segment_summaries=segment_results,
         )
         final_summary = await _complete_with_k2(final_prompt, max_tokens=1200)
+        if final_summary and _is_unhelpful_video_summary_text(final_summary):
+            final_summary = await _repair_daily_video_final_summary(final_prompt)
         if not final_summary:
             final_summary = "\n\n".join(
                 f"{segment.start}-{segment.end}: {segment.summary}"
@@ -1299,6 +1610,18 @@ async def daily_video_summary(
                 )
                 for event in selection.events
             ],
+            timeline=[
+                DailyVideoTimelineResp(
+                    start=format_seconds(segment.start_s),
+                    end=format_seconds(segment.end_s),
+                    reason=segment.reason,
+                    risk_level=segment.risk_level,
+                    peak_score=segment.peak_score,
+                    event_count=segment.event_count,
+                    danger_count=segment.danger_count,
+                )
+                for segment in selection.timeline_segments
+            ],
             segments=segment_results,
             summary=final_summary,
             dangers=_extract_danger_lines(final_summary),
@@ -1324,13 +1647,38 @@ async def root() -> FileResponse:
 
 
 @app.get("/health")
-async def health() -> dict:
+async def health(response: Response) -> dict:
+    probe = seeingeye_bridge.runtime_probe()
+    openai_ready = bool(_OPENAI_API_KEY)
+    k2_ready = bool(_K2_API_KEY)
+    core_ready = probe.ok and openai_ready and k2_ready
+    if not core_ready:
+        response.status_code = 503
+
+    issues: list[str] = []
+    if not probe.root_found:
+        issues.append("spaz_root_missing")
+    elif not probe.import_ok:
+        issues.append("spaz_import_failed")
+    elif not probe.runtime_ok:
+        issues.append("spaz_runtime_unavailable")
+    if not openai_ready:
+        issues.append("openai_api_key_missing")
+    if not k2_ready:
+        issues.append("k2_api_key_missing")
+
     return {
-        "ok": True,
-        "mode": "spaz" if seeingeye_bridge.STATUS.available else "stub",
-        "spaz_available": seeingeye_bridge.STATUS.available,
+        "ok": core_ready,
+        "mode": "spaz" if probe.root_found else "stub",
+        "spaz_available": probe.ok,
+        "spaz_root_found": probe.root_found,
+        "spaz_import_ok": probe.import_ok,
+        "spaz_runtime_ok": probe.runtime_ok,
         "spaz_path": str(seeingeye_bridge.STATUS.root) if seeingeye_bridge.STATUS.root else None,
-        "spaz_reason": seeingeye_bridge.STATUS.reason,
+        "spaz_reason": probe.reason or seeingeye_bridge.STATUS.reason,
+        "openai_ready": openai_ready,
+        "k2_ready": k2_ready,
         "elevenlabs": bool(_ELEVENLABS_KEY),
         "geocoding": bool(_GMAPS_KEY),
+        "issues": issues,
     }

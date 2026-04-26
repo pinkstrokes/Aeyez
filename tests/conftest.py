@@ -47,6 +47,17 @@ async def client(tmp_path, monkeypatch):
             reason=None,
         ),
     )
+    monkeypatch.setattr(
+        seeingeye_bridge,
+        "runtime_probe",
+        lambda: seeingeye_bridge.RuntimeProbe(
+            ok=True,
+            import_ok=True,
+            runtime_ok=True,
+            root_found=True,
+            reason=None,
+        ),
+    )
 
     class _FakeResult:
         def __init__(self, answer: str):

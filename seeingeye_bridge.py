@@ -21,6 +21,15 @@ class BridgeStatus:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class RuntimeProbe:
+    ok: bool
+    import_ok: bool
+    runtime_ok: bool
+    root_found: bool
+    reason: str | None = None
+
+
 def _candidate_roots() -> list[Path]:
     env_path = (
         os.environ.get("SPAZ_PATH") or os.environ.get("SEEINGEYE_PATH") or ""
@@ -102,6 +111,52 @@ def _require_runner_module():
     except Exception as exc:  # pragma: no cover - exercised only on broken installs
         raise SpazUnavailableError(f"Failed to import Spaz runtime: {exc}") from exc
     return runner, configure_logging, SeeingEyeResult, SIR
+
+
+def runtime_probe() -> RuntimeProbe:
+    """Best-effort readiness probe for the local Spaz runtime.
+
+    This verifies more than "the folder exists": the runtime must be importable,
+    and the graph runner module used by multi-frame requests must also import.
+    """
+    if not STATUS.available or STATUS.root is None:
+        return RuntimeProbe(
+            ok=False,
+            import_ok=False,
+            runtime_ok=False,
+            root_found=False,
+            reason=STATUS.reason or "Spaz root not found.",
+        )
+
+    try:
+        _require_runtime()
+    except Exception as exc:
+        return RuntimeProbe(
+            ok=False,
+            import_ok=False,
+            runtime_ok=False,
+            root_found=True,
+            reason=str(exc),
+        )
+
+    try:
+        _require_runner_module()
+    except Exception as exc:
+        return RuntimeProbe(
+            ok=False,
+            import_ok=True,
+            runtime_ok=False,
+            root_found=True,
+            reason=str(exc),
+        )
+
+    return RuntimeProbe(
+        ok=True,
+        import_ok=True,
+        runtime_ok=True,
+        root_found=True,
+        reason=None,
+    )
 
 
 def _strip_data_url(value: str) -> tuple[bytes, str]:
