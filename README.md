@@ -3,7 +3,7 @@
 A hackathon-style web demo that helps blind users understand what's in front
 of the camera. The browser captures a still every 5 seconds (or on demand),
 sends it to the underlying
-[Spaz](../README.md#about-seeingeye-the-underlying-framework) multi-agent
+[Spaz](./Spaz/README.md) multi-agent
 pipeline for description, and reads the answer aloud. Two complementary
 on-demand modes: **"What just changed?"** compares two frames sampled ~10 s
 apart, and **"Hold to speak"** lets the user ask follow-up questions by voice.
@@ -101,6 +101,9 @@ aren't recorded.
 pip install -r requirements.txt
 ```
 
+This installs both the Aeyez web server dependencies and the bundled Spaz
+runtime dependencies.
+
 The Spaz runtime is bundled in this repo under `./Spaz`. The bridge looks in
 this order:
 
@@ -130,10 +133,10 @@ Optional environment variables:
 | `AEYEZ_SKIP_SECRET_CHECK` | Set to `1` to bypass the JWT-secret check (test fixtures only — never in production). |
 | `GOOGLE_MAPS_API_KEY` | Reverse-geocode lat/lon into addresses for saved locations. |
 
-For live model responses, Spaz also needs its own config. The simplest
-path is to keep a working `.env` in the Spaz repo with `OPENAI_API_KEY`
-and any `SPAZ_*` overrides you want. Aeyez will load that file
-automatically if the environment is not already set.
+For live model responses, set `OPENAI_API_KEY` and any `SEEINGEYE_*` model
+overrides in your shell, Docker `.env`, or `Spaz/.env`. Aeyez loads
+`Spaz/.env` automatically if the environment is not already set. Use
+`Spaz/.env.example` or the root `.env.example` as a starting point.
 
 ### Start the server
 
@@ -149,7 +152,8 @@ pytest                                     # 41 tests, ~12 s
 pytest --cov=server --cov=auth --cov=database --cov-report=term
 ```
 
-CI runs the same suite on every push and PR via `.github/workflows/test.yml`.
+The published branch currently omits GitHub Actions so it can be pushed with
+a normal token. Add a workflow later if you want hosted CI.
 
 ### LAN demo on a phone (HTTPS via mkcert)
 
@@ -259,21 +263,6 @@ python -m vllm.entrypoints.openai.api_server \
   --tool-call-parser hermes
 ```
 
-### Fully-hosted fallback (target — no GPU)
-
-Open `src/multi-agent/config/config.toml`, find the `[llm.reasoning_api]`
-block, and swap it to OpenAI just like the translator:
-
-```toml
-[llm.reasoning_api]
-model = "gpt-4o-mini"
-api_type = "openai"
-base_url = "https://api.openai.com/v1"
-api_key = ""           # patched at runtime from OPENAI_API_KEY
-max_tokens = 1024
-temperature = 0.2
-```
-
 ## Endpoints
 
 | Method | Path | Auth | What it does |
@@ -283,10 +272,10 @@ temperature = 0.2
 | GET | `/profile` | required | Return user profile + history count. |
 | PATCH | `/profile` | required | Update display name and/or password. |
 | GET | `/history` | required | List the user's last N events. |
-| POST | `/investigate` | optional | Single-frame description (currently stub). Saves history when authenticated. |
-| POST | `/analyze-change` | optional | Two-frame diff (currently stub). Saves history when authenticated. |
+| POST | `/investigate` | optional | Single-frame Spaz description. Saves history when authenticated. |
+| POST | `/analyze-change` | optional | Multi-frame Spaz comparison. Saves history when authenticated. |
 | POST | `/chat` | optional | Voice question → text reply + optional ElevenLabs MP3. Saves history when authenticated. |
-| GET | `/health` | none | Liveness + mode. |
+| GET | `/health` | none | Liveness + Spaz availability/path. |
 
 ## Demo plan (stage-day)
 
@@ -324,41 +313,37 @@ temperature = 0.2
   sweep runs even when no new captures arrive. Default 10 s.
 - `CLIP_WINDOW_MS` / `CLIP_FPS` (frontend, `app.js`): rolling-window length
   and sampling rate handed to `ClipBuffer`. Default 10 s @ 1 fps.
-- `STUB_RESPONSES` (backend, `server.py`, **stub mode**): canned reply per
-  event. Will be replaced by `EVENT_PROMPTS` (per-event investigative
-  prompts) when Spaz is reconnected — that prompt map is the hackathon
-  "secret sauce".
+- `EVENT_PROMPTS` (backend, `server.py`): per-event investigative prompts
+  used before frames are sent to Spaz.
 - `_build_context(...)` (backend, `server.py`): formats recent history into
   a prompt prefix that will be injected into the real model once integrated,
   giving it memory of past observations.
 - `_EXPIRY_HOURS` (backend, `auth.py`): JWT lifetime, default 24 h.
-- Reasoner `max_steps` (in `src/multi-agent/config/config.toml` under
-  `[flow]`, **target architecture**): drop from 3 → 1 to cut latency at the
-  cost of reasoning depth.
+- `SEEINGEYE_VIDEO_FRAME_INTERVAL_S` / `SEEINGEYE_VIDEO_MAX_FRAMES`: Spaz
+  video-frame sampling controls for longer clips.
 
 ## File map
 
 | Path | Purpose |
 |---|---|
-| `server.py` | FastAPI app — auth, history, profile, investigate, analyze-change, chat, health. Stub responses for the model paths; `# TODO` markers point to where Spaz will plug back in. |
+| `server.py` | FastAPI app — auth, history, profile, investigate, analyze-change, chat, health. Model endpoints call the bundled Spaz runtime through `seeingeye_bridge.py`. |
+| `seeingeye_bridge.py` | Locates `./Spaz`, loads model environment, and adapts browser image frames into Spaz runtime calls. |
 | `auth.py` | bcrypt password hashing + PyJWT token issuance/verification. `require_user` and `optional_user` dependencies. |
 | `database.py` | aiosqlite wrappers for users (id, username, password_hash, display_name) and history (type, event, input, response, timestamp). Auto-creates schema on startup. |
-| `aeyez.db` | SQLite store. *Note: tracked in git from prior commit; not ideal — see "Cleanup follow-ups".* |
-| `requirements.txt` | fastapi, uvicorn, httpx (ElevenLabs), aiosqlite, bcrypt, PyJWT. |
+| `Spaz/` | Bundled multimodal reasoning runtime and tests. Runtime secrets are intentionally not committed. |
+| `requirements.txt` | Aeyez web dependencies plus `Spaz/requirements.txt` for the live model bridge. |
 | `static/index.html` | Auth overlay, two-column layout (camera left, app/profile right), corner user menu. |
 | `static/app.js` | Camera init, ClipBuffer wiring, 5 s auto-capture loop, manual buttons, voice chat (`SpeechRecognition` → `/chat` → ElevenLabs audio), TTS, fetch + Bearer auth + cache pruning. |
 | `static/auth.js` | Auth flows (login/register/logout), profile panel (display name, password change), history panel (server-driven via `/history`). Exposes `window.getAuthHeaders` and `window.refreshHistory`. |
 | `static/clip_buffer.js` | `ClipBuffer` class — rolling 10 s frame window with named sampling strategies (`latest` / `edges` / `uniform`). The seam between "video coming in" and "images going to the model". |
 | `static/style.css` | Dark theme, two-column layout, panels, animations. |
-| `src/multi-agent/config/config.toml` *(target architecture, not yet active)* | `[llm.translator_api]` repointed at OpenAI; `[llm.reasoning_api]` left on local vLLM (`:8001`). |
 
 ## Limits / honest caveats
 
 - Chrome recommended. `SpeechRecognition` (used for voice chat) is
   Chromium-only; the rest works in any modern browser.
 - Auto-capture narration is gated by a client-side perceptual hash
-  (`CHANGE_THRESHOLD`). Static scenes are silent — including in stub mode,
-  where the canned reply only fires when the scene actually changes. The
+  (`CHANGE_THRESHOLD`). Static scenes are silent. The
   first tick of every auto-capture run still fires a baseline `/investigate`
   so the user gets an initial description; subsequent ticks route through
   `/analyze-change` for a "what changed" framing.
@@ -367,9 +352,9 @@ temperature = 0.2
   shared deployment.
 - ElevenLabs is optional. Without the key, `/chat.audio_b64` is `null` and
   the browser falls back to `speechSynthesis`.
-- `/analyze-change` is designed to bypass the agent loop and call the hosted
-  VLM directly with both frames — the agent loop is overkill (and too slow)
-  for a frame diff. (Currently stubbed.)
+- Live model calls require a valid model API key. Without one, the web app
+  still starts, but `/investigate`, `/analyze-change`, `/chat`, and
+  `/safe-mode` cannot return real model answers.
 
 ### Fresh database
 

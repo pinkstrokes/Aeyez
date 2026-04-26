@@ -2,9 +2,13 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# System deps: bcrypt is a wheel on linux/amd64 + arm64 so no compile toolchain needed.
+# Runtime libraries needed by OpenCV/img2table inside the bundled Spaz runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+COPY Spaz/requirements.txt Spaz/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .

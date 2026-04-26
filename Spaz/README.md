@@ -232,8 +232,6 @@ benchmark_evaluation/    # Paper's benchmark harnesses — preserved for
                          # (deferred Phase 6 PAR-01).
 
 tests/                   # 146 structural tests (Phase 2-5, post-Phase-7 trim)
-.planning/               # Full migration history: roadmap, phases,
-                         # research, per-phase plans + summaries.
 ```
 
 ## Development
@@ -253,10 +251,6 @@ are all covered structurally. Benchmark-accuracy testing is deferred
 
 ## Migration History
 
-See [PROJECT.md](./.planning/PROJECT.md) for the project vision, key
-decisions, and requirement traceability.
-See [.planning/ROADMAP.md](./.planning/ROADMAP.md) for the 7-phase
-migration plan and current status.
 See [SECURITY.md](./SECURITY.md) for the v1.0 risk-acceptance record
 (credential history, empirical validation gap, unverified deviations).
 

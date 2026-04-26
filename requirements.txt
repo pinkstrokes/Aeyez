@@ -5,3 +5,8 @@ aiosqlite>=0.20.0
 bcrypt>=4.1.0
 PyJWT>=2.8.0
 slowapi>=0.1.9
+python-multipart>=0.0.9
+
+# Bundled Spaz runtime dependencies. A fresh clone should be able to run the
+# live model bridge after one root-level install command.
+-r Spaz/requirements.txt
