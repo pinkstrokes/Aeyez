@@ -15,6 +15,7 @@ Endpoints:
   POST /analyze-change      — two-frame scene-diff narration   (optional auth → history saved)
   POST /chat                — voice chat + ElevenLabs TTS       (optional auth → history saved)
   POST /safe-mode           — active guidance mode with recent frames (optional auth → history saved)
+  POST /daily-video-summary — uploaded long-video timeline + hazard summary
   GET  /health              — readiness probe
 
 Env vars:
@@ -29,6 +30,7 @@ import base64
 import math
 import os
 import re
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -36,7 +38,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -47,6 +49,14 @@ from slowapi.util import get_remote_address
 import auth
 import database
 import seeingeye_bridge
+from video_analysis import (
+    DailySelection,
+    choose_segment_model_frames,
+    frame_to_runtime_payload,
+    format_seconds,
+    frames_to_model_payload,
+    select_daily_video_frames,
+)
 
 DEMO_DIR = Path(__file__).resolve().parent
 STATIC_DIR = DEMO_DIR / "static"
@@ -67,6 +77,13 @@ _load_env_file(DEMO_DIR / ".env")
 
 _ELEVENLABS_KEY = os.environ.get("ELEVENLABS_API_KEY", "").strip()
 _ELEVENLABS_VOICE = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+_ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5")
+_OPENAI_API_KEY = (
+    os.environ.get("OPENAI_API_KEY")
+    or os.environ.get("SEEINGEYE_API_KEY")
+    or ""
+).strip()
+_OPENAI_TRANSCRIBE_MODEL = os.environ.get("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 _GMAPS_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
 _AEYEZ_ENV = os.environ.get("AEYEZ_ENV") or os.environ.get("AEYES_ENV") or "dev"
 _IS_PROD = _AEYEZ_ENV == "prod"
@@ -89,6 +106,9 @@ _K2_SUMMARIZER_MODEL = (
 ).strip()
 
 _MATCH_RADIUS_METERS = 100
+_DAILY_VIDEO_MAX_SECONDS = 30 * 60
+_DAILY_SEGMENT_SECONDS = 5 * 60
+_DAILY_SEGMENT_MAX_FRAMES = 36
 
 
 @asynccontextmanager
@@ -142,18 +162,23 @@ async def _elevenlabs_tts(text: str) -> Optional[str]:
     """Call ElevenLabs and return base64-encoded MP3, or None if key not set."""
     if not _ELEVENLABS_KEY:
         return None
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{_ELEVENLABS_VOICE}",
-            headers={"xi-api-key": _ELEVENLABS_KEY, "Content-Type": "application/json"},
-            json={
-                "text": text,
-                "model_id": "eleven_turbo_v2_5",
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-            },
-            timeout=30.0,
-        )
-    if r.status_code != 200:
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{_ELEVENLABS_VOICE}",
+                headers={
+                    "xi-api-key": _ELEVENLABS_KEY,
+                    "Accept": "audio/mpeg",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "text": text,
+                    "model_id": _ELEVENLABS_MODEL,
+                    "voice_settings": {"stability": 0.45, "similarity_boost": 0.8},
+                },
+            )
+            r.raise_for_status()
+    except Exception:
         return None
     return base64.b64encode(r.content).decode()
 
@@ -164,7 +189,7 @@ async def _summarize_with_k2(text: str) -> Optional[str]:
         return None
     prompt = (
         "Summarize the following visual-assistant output for a blind user in one short sentence. "
-        "Keep only the most actionable takeaway, under 20 words, and do not add preamble.\n\n"
+        "Keep only the most actionable takeaway, under 12 words, and do not add preamble.\n\n"
         f"Output:\n{text.strip()}"
     )
     try:
@@ -194,6 +219,90 @@ async def _summarize_with_k2(text: str) -> Optional[str]:
         return None
     summary = (message or "").strip()
     return summary or None
+
+
+async def _final_spoken_with_k2(
+    model_output: str,
+    *,
+    user_text: Optional[str] = None,
+    mode: str = "visual answer",
+) -> Optional[str]:
+    """Compress a full SeeingEye/Spaz answer into the final text we show and speak."""
+    if not _K2_API_KEY or not model_output.strip():
+        return None
+    user_line = f"\nUser question: {user_text.strip()}" if user_text else ""
+    prompt = (
+        "Rewrite the visual model output as the final answer that will be read aloud. "
+        "Make it short and sharp, but do not omit any concrete safety or navigation detail. "
+        "Preserve every hazard, location, direction, object/person, visible text, timestamp, "
+        "and recommended action from the original. Remove filler, uncertainty hedging, and repeated wording. "
+        "Lead with danger/action if present. Target 1-2 compact sentences; use semicolons if needed "
+        "to keep multiple details without making it long. Do not add facts.\n\n"
+        f"Mode: {mode}{user_line}\n\n"
+        f"Visual model output:\n{model_output.strip()}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            response = await client.post(
+                f"{_K2_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {_K2_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": _K2_SUMMARIZER_MODEL,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a final speech editor for a blind-assistance camera. "
+                                "Compress aggressively while preserving all concrete details."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "max_tokens": 140,
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+        final = (data["choices"][0]["message"]["content"] or "").strip()
+    except Exception:
+        return None
+    return final or None
+
+
+async def _complete_with_k2(prompt: str, *, max_tokens: int = 900) -> Optional[str]:
+    if not _K2_API_KEY or not prompt.strip():
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{_K2_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {_K2_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": _K2_SUMMARIZER_MODEL,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You summarize long visual timelines for a blind user. "
+                                "Be specific, time-stamped, and safety-focused."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "max_tokens": max_tokens,
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+        return (data["choices"][0]["message"]["content"] or "").strip() or None
+    except Exception:
+        return None
 
 
 # ── Geolocation helpers ───────────────────────────────────────────────────────
@@ -555,7 +664,8 @@ def _chat_prompt(context: str, text: str) -> str:
             "When three frames are provided, interpret them as approximately 1.5 seconds before the "
             "question, the exact question moment, and 1.5 seconds after the question. Use the change "
             "across those frames to infer what just happened, what is happening now, and what the user "
-            "should know next. Keep it direct, grounded in what is visible, and useful for a blind user."
+            "should know next. Be complete and grounded in what is visible; the final speech editor will "
+            "compress your answer afterward."
         ),
         context=context,
         user_text=text,
@@ -642,19 +752,24 @@ async def investigate(
     question = _describe_prompt(context)
 
     try:
-        response = await _run_seeingeye_image(question, req.image_b64)
+        raw_response = await _run_seeingeye_image(question, req.image_b64)
         success = True
     except Exception as exc:
-        response = _bridge_error_message(exc)
+        raw_response = _bridge_error_message(exc)
         success = False
-    summary = await _summarize_with_k2(response)
+    response = (
+        await _final_spoken_with_k2(raw_response, mode="single-frame scene description")
+        if success
+        else None
+    ) or raw_response
+    summary = None
 
     if current_user:
         loc_id, loc_name = await _resolve_location(current_user["id"], req.lat, req.lon)
         await database.add_history(
             user_id=current_user["id"],
             type="investigate",
-            response=response,
+            response=raw_response,
             input_text=req.event,
             event=req.event,
             lat=req.lat,
@@ -700,19 +815,24 @@ async def analyze_change(
     question = _change_prompt(context)
 
     try:
-        response = await _run_seeingeye_frames(question, [req.frame0_b64, req.frame1_b64])
+        raw_response = await _run_seeingeye_frames(question, [req.frame0_b64, req.frame1_b64])
         success = True
     except Exception as exc:
-        response = _bridge_error_message(exc)
+        raw_response = _bridge_error_message(exc)
         success = False
-    summary = await _summarize_with_k2(response)
+    response = (
+        await _final_spoken_with_k2(raw_response, mode="two-frame change analysis")
+        if success
+        else None
+    ) or raw_response
+    summary = None
 
     if current_user:
         loc_id, loc_name = await _resolve_location(current_user["id"], req.lat, req.lon)
         await database.add_history(
             user_id=current_user["id"],
             type="change",
-            response=response,
+            response=raw_response,
             lat=req.lat,
             lon=req.lon,
             location_id=loc_id,
@@ -752,6 +872,47 @@ class ChatResp(BaseModel):
     referenced_location: Optional[LocationRef] = None
 
 
+class TranscribeResp(BaseModel):
+    text: str
+    success: bool
+
+
+@app.post("/transcribe", response_model=TranscribeResp)
+@limiter.limit("30/minute")
+async def transcribe_audio(
+    request: Request,
+    audio: UploadFile = File(...),
+) -> TranscribeResp:
+    if not _OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OpenAI API key is not configured.")
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="No audio received.")
+    if len(audio_bytes) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio is too large.")
+
+    filename = audio.filename or "speech.webm"
+    content_type = audio.content_type or "audio/webm"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {_OPENAI_API_KEY}"},
+                data={
+                    "model": _OPENAI_TRANSCRIBE_MODEL,
+                    "language": "en",
+                },
+                files={"file": (filename, audio_bytes, content_type)},
+            )
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Transcription failed: {exc}") from exc
+
+    text = (data.get("text") or "").strip()
+    return TranscribeResp(text=text, success=bool(text))
+
+
 @app.post("/chat", response_model=ChatResp)
 @limiter.limit("30/minute")
 async def chat(
@@ -764,7 +925,8 @@ async def chat(
     context = _build_context(history)
 
     referenced: Optional[LocationRef] = None
-    stub_response: str
+    raw_response: str
+    model_generated = False
 
     # Feature 1: "where did I (last) see X?" — find an object across history
     # and surface where it was last observed, plus a map pin for the client
@@ -776,7 +938,7 @@ async def chat(
             loc_str = f" at {match['location_name']}" if match.get("location_name") else ""
             when = _relative_time(match["created_at"])
             snippet = (match.get("response") or "")[:120].rstrip(".")
-            stub_response = (
+            raw_response = (
                 f'You last saw something matching "{obj}"{loc_str} {when}: "{snippet}…" '
                 "(Stub response — real model coming soon.)"
             )
@@ -787,7 +949,7 @@ async def chat(
                     lon=match["lon"],
                 )
         else:
-            stub_response = (
+            raw_response = (
                 f'I don\'t have any past observations matching "{obj}". '
                 "(Stub: real model coming soon.)"
             )
@@ -796,7 +958,7 @@ async def chat(
         # against the user's saved locations and return a per-location summary.
         loc_match = _match_location_query(req.text, locations) if locations else None
         if loc_match:
-            stub_response = _summarize_at_location(history, loc_match)
+            raw_response = _summarize_at_location(history, loc_match)
             referenced = LocationRef(
                 name=loc_match["name"],
                 lat=loc_match["lat"],
@@ -807,24 +969,30 @@ async def chat(
             question = _chat_prompt(context, req.text)
             try:
                 if frames:
-                    stub_response = await _run_seeingeye_frames(question, frames[:5])
+                    raw_response = await _run_seeingeye_frames(question, frames[:5])
+                    model_generated = True
                 else:
-                    stub_response = (
+                    raw_response = (
                         f'You asked: "{req.text}". '
                         "I do not have a recent camera frame yet, so I can only answer from saved history."
                     )
             except Exception as exc:
-                stub_response = _bridge_error_message(exc)
+                raw_response = _bridge_error_message(exc)
 
-    summary = await _summarize_with_k2(stub_response)
-    audio_b64 = await _elevenlabs_tts(stub_response)
+    response = (
+        await _final_spoken_with_k2(raw_response, user_text=req.text, mode="voice question answer")
+        if model_generated
+        else None
+    ) or raw_response
+    summary = None
+    audio_b64 = await _elevenlabs_tts(response)
 
     if current_user:
         loc_id, loc_name = await _resolve_location(current_user["id"], req.lat, req.lon)
         await database.add_history(
             user_id=current_user["id"],
             type="chat",
-            response=stub_response,
+            response=raw_response,
             input_text=req.text,
             lat=req.lat,
             lon=req.lon,
@@ -834,7 +1002,7 @@ async def chat(
 
     return ChatResp(
         text=req.text,
-        response=stub_response,
+        response=response,
         summary=summary,
         audio_b64=audio_b64,
         success=True,
@@ -876,27 +1044,32 @@ async def safe_mode(
     question = _safe_mode_prompt(context, req.text, len(frames))
     if frames:
         try:
-            stub_response = await _run_seeingeye_frames(question, frames[:5])
+            raw_response = await _run_seeingeye_frames(question, frames[:5])
             success = True
         except Exception as exc:
-            stub_response = _bridge_error_message(exc)
+            raw_response = _bridge_error_message(exc)
             success = False
     else:
-        stub_response = (
+        raw_response = (
             "Safe mode is active, but I do not have any recent camera frame yet. "
             "Point the camera at the scene and try again."
         )
         success = False
 
-    summary = await _summarize_with_k2(stub_response)
-    audio_b64 = await _elevenlabs_tts(stub_response)
+    response = (
+        await _final_spoken_with_k2(raw_response, user_text=req.text, mode="safe-mode mobility guidance")
+        if success
+        else None
+    ) or raw_response
+    summary = None
+    audio_b64 = await _elevenlabs_tts(response)
 
     if current_user:
         loc_id, loc_name = await _resolve_location(current_user["id"], req.lat, req.lon)
         await database.add_history(
             user_id=current_user["id"],
             type="safe_mode",
-            response=stub_response,
+            response=raw_response,
             input_text=req.text,
             lat=req.lat,
             lon=req.lon,
@@ -905,12 +1078,239 @@ async def safe_mode(
         )
 
     return SafeModeResp(
-        response=stub_response,
+        response=response,
         summary=summary,
         audio_b64=audio_b64,
         elapsed_seconds=round(time.time() - start, 3),
         success=success,
     )
+
+
+# ── Daily video summary endpoint ──────────────────────────────────────────────
+
+class DailyVideoFrameResp(BaseModel):
+    timestamp: str
+    timestamp_s: float
+    reason: str
+
+
+class DailyVideoEventResp(BaseModel):
+    start: str
+    end: str
+    peak: str
+    peak_score: float
+    danger_candidate: bool
+    frame_timestamps: list[str]
+
+
+class DailyVideoSegmentResp(BaseModel):
+    start: str
+    end: str
+    frame_count: int
+    summary: str
+
+
+class DailyVideoSummaryResp(BaseModel):
+    duration_seconds: float
+    retained_frame_count: int
+    model_frame_count: int
+    baseline_frames_per_minute: int
+    events: list[DailyVideoEventResp]
+    segments: list[DailyVideoSegmentResp]
+    summary: str
+    dangers: list[str]
+    evidence_frames: list[DailyVideoFrameResp]
+    elapsed_seconds: float
+    success: bool
+
+
+def _daily_video_segment_prompt(
+    frames: list[dict],
+    *,
+    start_s: float,
+    end_s: float,
+) -> str:
+    frame_lines = "\n".join(
+        f"- {item['timestamp']} ({item['reason']})" for item in frames
+    )
+    return (
+        "Analyze this short slice of a camera video for a blind user. The attached frames "
+        "are chronological evidence frames from this time range.\n\n"
+        f"Time range: {format_seconds(start_s)} to {format_seconds(end_s)}\n"
+        f"Evidence frames:\n{frame_lines}\n\n"
+        "Return concise bullets with: what happened, notable objects/people/motion, "
+        "hazards, exact timestamps for hazards, where in the scene the hazard appears, "
+        "and practical advice. If there is no hazard, say so."
+    )
+
+
+def _daily_video_final_prompt(
+    *,
+    selection: DailySelection,
+    segment_summaries: list[DailyVideoSegmentResp],
+) -> str:
+    segments = "\n\n".join(
+        f"{segment.start}-{segment.end}: {segment.summary}"
+        for segment in segment_summaries
+    )
+    events = "\n".join(
+        (
+            f"- {format_seconds(event.start_s)}-{format_seconds(event.end_s)} "
+            f"peak {format_seconds(event.peak_s)} score={event.peak_score} "
+            f"danger_candidate={event.danger_candidate}"
+        )
+        for event in selection.events
+    ) or "- No major motion events detected by the frame selector."
+    return (
+        "Create the final daily-video demo summary for a blind user. The video is at most "
+        "30 minutes. Use the segment summaries and event selector metadata.\n\n"
+        f"Duration: {format_seconds(selection.duration_s)}\n"
+        f"Retained-frame rule: at least 5 frames per minute, plus event and danger frames.\n"
+        f"Retained frame count: {len(selection.selected_frames)}\n\n"
+        f"Event selector metadata:\n{events}\n\n"
+        f"Segment summaries:\n{segments}\n\n"
+        "Output exactly these sections:\n"
+        "1. Today Summary: 3-6 bullets.\n"
+        "2. Dangers: bullets with timestamp range, location in scene, risk, and advice. "
+        "If none, write 'No clear dangers detected.'\n"
+        "3. Timeline: chronological bullets with timestamps.\n"
+        "4. Confidence Notes: mention anything uncertain."
+    )
+
+
+def _extract_danger_lines(text: str) -> list[str]:
+    lines = []
+    in_dangers = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if "danger" in lower or "hazard" in lower:
+            in_dangers = True
+        elif in_dangers and re.match(r"^\d+[\).]\s+", line):
+            break
+        if in_dangers and ("-" in line[:3] or "danger" in lower or "hazard" in lower):
+            lines.append(line.lstrip("-* "))
+    return lines[:12]
+
+
+@app.post("/daily-video-summary", response_model=DailyVideoSummaryResp)
+@limiter.limit("4/hour")
+async def daily_video_summary(
+    request: Request,
+    video: UploadFile = File(...),
+    current_user: Optional[dict] = Depends(auth.optional_user),
+) -> DailyVideoSummaryResp:
+    start = time.time()
+    suffix = Path(video.filename or "upload.mp4").suffix or ".mp4"
+    if suffix.lower() not in {".mp4", ".mov", ".m4v", ".webm", ".avi"}:
+        raise HTTPException(status_code=400, detail="Upload a video file.")
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        while chunk := await video.read(1024 * 1024):
+            tmp.write(chunk)
+
+    try:
+        selection = select_daily_video_frames(
+            tmp_path,
+            baseline_frames_per_minute=5,
+            scan_interval_s=1.0,
+            change_threshold=8.0,
+            danger_threshold=18.0,
+            event_merge_gap_s=8.0,
+            event_padding_s=3.0,
+        )
+        if selection.duration_s > _DAILY_VIDEO_MAX_SECONDS:
+            raise HTTPException(status_code=400, detail="Demo uploads are limited to 30 minutes.")
+
+        segment_results: list[DailyVideoSegmentResp] = []
+        model_frame_count = 0
+        segment_start = 0.0
+        while segment_start < selection.duration_s:
+            segment_end = min(selection.duration_s, segment_start + _DAILY_SEGMENT_SECONDS)
+            segment_frames = choose_segment_model_frames(
+                selection,
+                start_s=segment_start,
+                end_s=segment_end,
+                max_frames=_DAILY_SEGMENT_MAX_FRAMES,
+            )
+            if not segment_frames:
+                segment_start = segment_end
+                continue
+            frame_meta = frames_to_model_payload(segment_frames)
+            question = _daily_video_segment_prompt(
+                frame_meta,
+                start_s=segment_start,
+                end_s=segment_end,
+            )
+            try:
+                result = await seeingeye_bridge.run_on_frame_payloads(
+                    question,
+                    [frame_to_runtime_payload(frame) for frame in segment_frames],
+                )
+                segment_summary = result.answer.strip()
+            except Exception as exc:
+                segment_summary = _bridge_error_message(exc)
+            model_frame_count += len(segment_frames)
+            segment_results.append(
+                DailyVideoSegmentResp(
+                    start=format_seconds(segment_start),
+                    end=format_seconds(segment_end),
+                    frame_count=len(segment_frames),
+                    summary=segment_summary,
+                )
+            )
+            segment_start = segment_end
+
+        final_prompt = _daily_video_final_prompt(
+            selection=selection,
+            segment_summaries=segment_results,
+        )
+        final_summary = await _complete_with_k2(final_prompt, max_tokens=1200)
+        if not final_summary:
+            final_summary = "\n\n".join(
+                f"{segment.start}-{segment.end}: {segment.summary}"
+                for segment in segment_results
+            ) or "No analyzable frames were selected."
+
+        if current_user:
+            await database.add_history(
+                user_id=current_user["id"],
+                type="daily_video",
+                response=final_summary,
+                input_text=video.filename or "uploaded video",
+            )
+
+        return DailyVideoSummaryResp(
+            duration_seconds=selection.duration_s,
+            retained_frame_count=len(selection.selected_frames),
+            model_frame_count=model_frame_count,
+            baseline_frames_per_minute=5,
+            events=[
+                DailyVideoEventResp(
+                    start=format_seconds(event.start_s),
+                    end=format_seconds(event.end_s),
+                    peak=format_seconds(event.peak_s),
+                    peak_score=event.peak_score,
+                    danger_candidate=event.danger_candidate,
+                    frame_timestamps=[format_seconds(ts) for ts in event.frame_timestamps_s],
+                )
+                for event in selection.events
+            ],
+            segments=segment_results,
+            summary=final_summary,
+            dangers=_extract_danger_lines(final_summary),
+            evidence_frames=frames_to_model_payload(selection.selected_frames),
+            elapsed_seconds=round(time.time() - start, 3),
+            success=True,
+        )
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ── Static + root ─────────────────────────────────────────────────────────────

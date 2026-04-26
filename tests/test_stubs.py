@@ -94,6 +94,61 @@ async def test_safe_mode_with_recent_frames(client, auth_headers):
     assert r.json()["response"] == "Temporal summary from fake Spaz."
 
 
+async def test_daily_video_summary_uses_keyframe_selector(client, auth_headers, monkeypatch):
+    import server
+    from video_analysis import DailySelection, EventSegment, SelectedFrame
+
+    frames = [
+        SelectedFrame(timestamp_s=0.0, reason="baseline", data_url="data:image/jpeg;base64,a"),
+        SelectedFrame(timestamp_s=12.0, reason="baseline", data_url="data:image/jpeg;base64,b"),
+        SelectedFrame(timestamp_s=24.0, reason="event", data_url="data:image/jpeg;base64,c"),
+    ]
+    event = EventSegment(
+        start_s=20.0,
+        end_s=28.0,
+        peak_s=24.0,
+        peak_score=22.5,
+        danger_candidate=True,
+        frame_timestamps_s=[20.0, 24.0, 28.0],
+    )
+
+    def _fake_select(*_args, **_kwargs):
+        return DailySelection(
+            duration_s=60.0,
+            fps=30.0,
+            baseline_interval_s=12.0,
+            baseline_target_count=5,
+            selected_frames=frames,
+            events=[event],
+        )
+
+    async def _fake_k2(_prompt: str, max_tokens: int = 900):
+        return (
+            "1. Today Summary:\n- Demo summary.\n"
+            "2. Dangers:\n- 00:20-00:28: Possible hazard near the center.\n"
+            "3. Timeline:\n- 00:24: Motion changed.\n"
+            "4. Confidence Notes:\n- Test."
+        )
+
+    monkeypatch.setattr(server, "select_daily_video_frames", _fake_select)
+    monkeypatch.setattr(server, "_complete_with_k2", _fake_k2)
+
+    r = await client.post(
+        "/daily-video-summary",
+        files={"video": ("demo.mp4", b"not a real video", "video/mp4")},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is True
+    assert body["duration_seconds"] == 60.0
+    assert body["retained_frame_count"] == 3
+    assert body["model_frame_count"] == 3
+    assert body["baseline_frames_per_minute"] == 5
+    assert body["events"][0]["danger_candidate"] is True
+    assert body["dangers"]
+
+
 def test_safe_mode_prompt_includes_action_motion_path_model():
     import server
 

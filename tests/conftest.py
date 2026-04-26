@@ -35,6 +35,9 @@ async def client(tmp_path, monkeypatch):
     async def _no_summary(_text: str):
         return None
     monkeypatch.setattr(server, "_summarize_with_k2", _no_summary)
+    async def _no_final_spoken(_text: str, **_kwargs):
+        return None
+    monkeypatch.setattr(server, "_final_spoken_with_k2", _no_final_spoken)
     monkeypatch.setattr(
         seeingeye_bridge,
         "STATUS",
@@ -59,8 +62,14 @@ async def client(tmp_path, monkeypatch):
         assert frames_b64
         return _FakeResult("Temporal summary from fake Spaz.")
 
+    async def _fake_run_on_frame_payloads(question: str, frames: list[dict]):
+        assert question
+        assert frames
+        return _FakeResult("Temporal summary from fake Spaz.")
+
     monkeypatch.setattr(seeingeye_bridge, "run_on_image", _fake_run_on_image)
     monkeypatch.setattr(seeingeye_bridge, "run_on_frames", _fake_run_on_frames)
+    monkeypatch.setattr(seeingeye_bridge, "run_on_frame_payloads", _fake_run_on_frame_payloads)
     transport = ASGITransport(app=server.app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c

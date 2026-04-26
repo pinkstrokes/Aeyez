@@ -7,7 +7,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 
 class SpazUnavailableError(RuntimeError):
@@ -162,6 +162,48 @@ async def run_on_frames(question: str, frames_b64: Iterable[str]):
     image_frames = [
         _frame_from_b64(frame_b64, timestamp_s=index * 1.5)
         for index, frame_b64 in enumerate(frames)
+    ]
+    graph = runner._get_graph()
+    initial_state = {
+        "sir": SIR(content=""),
+        "outer_iter": 0,
+        "question": question,
+        "options": None,
+        "media_type": "video",
+        "image_b64": None,
+        "image_frames": image_frames,
+        "translator_messages": [],
+        "reasoner_messages": [],
+        "reasoner_feedback": None,
+        "final_answer": None,
+    }
+    final_state = await graph.ainvoke(initial_state, config={"recursion_limit": 50})
+    return SeeingEyeResult(
+        answer=final_state.get("final_answer") or "",
+        sir=final_state["sir"],
+        outer_iters_used=final_state.get("outer_iter", 0),
+        total_tokens=runner._sum_total_tokens(final_state),
+    )
+
+
+async def run_on_frame_payloads(question: str, frames: Iterable[dict[str, Any]]):
+    payloads = [frame for frame in frames if frame.get("b64")]
+    if not payloads:
+        raise ValueError("At least one frame is required.")
+    if len(payloads) == 1:
+        frame = payloads[0]
+        data_url = f"data:{frame.get('mime_type', 'image/jpeg')};base64,{frame['b64']}"
+        return await run_on_image(question, data_url)
+
+    runner, configure_logging, SeeingEyeResult, SIR = _require_runner_module()
+    configure_logging()
+    image_frames = [
+        {
+            "b64": frame["b64"],
+            "timestamp_s": frame.get("timestamp_s"),
+            "mime_type": frame.get("mime_type") or "image/jpeg",
+        }
+        for frame in payloads
     ]
     graph = runner._get_graph()
     initial_state = {

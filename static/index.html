@@ -5,6 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="theme-color" content="#0c0d10" />
   <title>Aeyez — auto scene narration</title>
+  <script>
+    if (window.location.protocol === "file:") {
+      window.location.replace("http://127.0.0.1:8001/");
+    }
+  </script>
   <link rel="manifest" href="/static/manifest.webmanifest" />
   <link rel="icon" type="image/svg+xml" href="/static/icons/icon.svg" />
   <link rel="apple-touch-icon" href="/static/icons/icon.svg" />
@@ -81,7 +86,7 @@
         </div>
 
         <footer>
-          <p class="muted">Buffers every 1.0 s · No frames stored · Vision via Spaz</p>
+          <p class="muted">Buffers every 1.5 s · No frames stored · Vision via SeeingEye</p>
         </footer>
       </div>
 
@@ -111,6 +116,16 @@
             <p id="voice-transcript" class="transcript-text" role="status" aria-live="polite" hidden></p>
             <p id="voice-response" class="response-text" role="status" aria-live="polite" hidden></p>
             <p id="voice-summary" class="summary-text" hidden></p>
+          </section>
+
+          <section id="video-summary-card" aria-labelledby="video-summary-label">
+            <p class="status-label" id="video-summary-label">Video summary</p>
+            <form id="video-summary-form">
+              <input id="video-upload" type="file" accept="video/*" />
+              <button id="video-summary-btn" type="submit">Summarize video</button>
+            </form>
+            <p id="video-summary-status" class="transcript-text" hidden></p>
+            <pre id="video-summary-output" hidden></pre>
           </section>
 
           <details id="history-panel" open>

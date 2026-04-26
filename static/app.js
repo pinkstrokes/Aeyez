@@ -15,14 +15,14 @@
 // work; they just aren't persisted.
 //
 // No frames are persisted on disk. The ClipBuffer is a fixed-size rolling
-// window in memory; it samples every 1.0s so safe mode can infer short-horizon
+// window in memory; it samples every 1.5s so safe mode can infer short-horizon
 // motion paths while voice questions can compare
 // the moment before the question, the question moment, and the moment after.
 
 const AUTO_CAPTURE_MS = 5_000;
 const QUESTION_CONTEXT_MS = 1_500;
 const CLIP_WINDOW_MS = 10_000;
-const CLIP_FRAME_INTERVAL_MS = 1_000;
+const CLIP_FRAME_INTERVAL_MS = QUESTION_CONTEXT_MS;
 const SAFE_MODE_FRAME_COUNT = 6;
 
 // Perceptual-hash threshold for the auto-capture change gate. Scale is the
@@ -57,6 +57,11 @@ const voiceBtn = $("voice-btn");
 const voiceTranscriptEl = $("voice-transcript");
 const voiceResponseEl = $("voice-response");
 const voiceSummaryEl = $("voice-summary");
+const videoSummaryForm = $("video-summary-form");
+const videoUploadEl = $("video-upload");
+const videoSummaryBtn = $("video-summary-btn");
+const videoSummaryStatusEl = $("video-summary-status");
+const videoSummaryOutputEl = $("video-summary-output");
 const thresholdSliderEl = $("threshold-slider");
 const thresholdValueEl = $("threshold-value");
 const lastDiffEl = $("last-diff");
@@ -71,7 +76,9 @@ const CAPTURE_MATCH_SLACK_MS = 8_000; // server clock vs client clock + roundtri
 const SAFE_MODE_PHRASES = [
   "tell me what to do", "guide me", "help me", "what should i do",
   "safe mode", "assist me", "i need help", "i need guidance",
+  "安全模式", "帮我", "引导我", "我该怎么办", "告诉我怎么走",
 ];
+const SPEECH_RECOGNITION_LANG = localStorage.getItem("aeyez_speech_lang") || "en-US";
 
 let busy = false;
 let clipBuffer = null;
@@ -131,6 +138,36 @@ function showLatency(seconds) {
   }
   latencyChipEl.textContent = `Responded in ${seconds.toFixed(2)}s`;
   latencyChipEl.hidden = false;
+}
+
+function formatVideoSummary(data) {
+  const dangers = data.dangers?.length
+    ? data.dangers.map((item) => `- ${item}`).join("\n")
+    : "- No clear dangers detected.";
+  const events = data.events?.length
+    ? data.events
+        .slice(0, 12)
+        .map((event) => (
+          `- ${event.start}-${event.end} peak ${event.peak} score ${event.peak_score}`
+          + (event.danger_candidate ? " danger-candidate" : "")
+        ))
+        .join("\n")
+    : "- No major motion events detected.";
+  return [
+    data.summary,
+    "",
+    "Dangers",
+    dangers,
+    "",
+    "Selector",
+    `- Duration: ${(data.duration_seconds / 60).toFixed(1)} min`,
+    `- Retained frames: ${data.retained_frame_count}`,
+    `- Model frames: ${data.model_frame_count}`,
+    `- Baseline: ${data.baseline_frames_per_minute}/min`,
+    "",
+    "Detected events",
+    events,
+  ].join("\n");
 }
 
 // ---------------- Captured-frame cache ----------------
@@ -670,11 +707,7 @@ async function runSafeMode(triggerText) {
     voiceResponseEl.hidden = false;
     showSummary(data.summary || "", voiceSummaryEl);
     showResponse(data.response);
-    if (data.audio_b64) {
-      await playAudioB64(data.audio_b64);
-    } else {
-      speak(data.response);
-    }
+    await speakReply(data.response, data.audio_b64);
     window.refreshHistory?.();
   } catch (e) {
     setStatus("Network error.", "error");
@@ -694,13 +727,23 @@ async function runSafeMode(triggerText) {
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 let recognition = null;
 let voiceBusy = false;
+let recognitionActive = false;
+let recognitionStopRequested = false;
+let recognitionStartedAt = 0;
+let micPermissionReady = false;
+let replyAudio = null;
+let voiceRecorder = null;
+let voiceRecorderStream = null;
+let voiceChunks = [];
+let voiceRecordingStartedAt = 0;
 
 function initRecognition() {
   if (!SpeechRecognition) return null;
   const r = new SpeechRecognition();
-  r.continuous = false;
-  r.interimResults = false;
-  r.lang = "en-US";
+  r.continuous = true;
+  r.interimResults = true;
+  r.maxAlternatives = 1;
+  r.lang = SPEECH_RECOGNITION_LANG;
   return r;
 }
 
@@ -708,9 +751,161 @@ async function playAudioB64(b64) {
   const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
   const blob = new Blob([bytes], { type: "audio/mpeg" });
   const url = URL.createObjectURL(blob);
+  stopReplyAudio();
   const audio = new Audio(url);
-  await audio.play();
-  audio.onended = () => URL.revokeObjectURL(url);
+  replyAudio = audio;
+  const cleanup = () => {
+    URL.revokeObjectURL(url);
+    if (replyAudio === audio) replyAudio = null;
+  };
+  audio.onended = cleanup;
+  audio.onerror = cleanup;
+  try {
+    await audio.play();
+  } catch (e) {
+    cleanup();
+    throw e;
+  }
+}
+
+async function speakReply(text, audioB64) {
+  if (!audioB64) {
+    speak(text, { cancel: false });
+    return;
+  }
+  try {
+    await playAudioB64(audioB64);
+  } catch (e) {
+    console.warn("ElevenLabs audio playback failed; falling back to browser TTS.", e);
+    speak(text, { cancel: false });
+  }
+}
+
+function stopReplyAudio() {
+  if (!replyAudio) return;
+  try {
+    replyAudio.pause();
+    replyAudio.currentTime = 0;
+  } catch {}
+  replyAudio = null;
+}
+
+async function ensureMicPermission() {
+  if (micPermissionReady) return true;
+  if (!navigator.mediaDevices?.getUserMedia) return true;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    for (const track of stream.getTracks()) track.stop();
+    micPermissionReady = true;
+    return true;
+  } catch (e) {
+    console.error("Microphone permission failed", e);
+    voiceTranscriptEl.textContent = "Mic permission denied. Allow microphone access, then try again.";
+    voiceTranscriptEl.hidden = false;
+    return false;
+  }
+}
+
+function cleanupVoiceRecorder() {
+  if (voiceRecorderStream) {
+    for (const track of voiceRecorderStream.getTracks()) track.stop();
+  }
+  voiceRecorderStream = null;
+  voiceRecorder = null;
+  voiceChunks = [];
+}
+
+async function transcribeVoiceBlob(blob) {
+  const formData = new FormData();
+  formData.append("audio", blob, "speech.webm");
+  const resp = await fetch("/transcribe", {
+    method: "POST",
+    headers: { ...window.getAuthHeaders?.() },
+    body: formData,
+  });
+  const data = await resp.json();
+  if (!resp.ok || !data.success || !data.text) {
+    throw new Error(data.detail || "No speech caught.");
+  }
+  return data.text.trim();
+}
+
+async function startVoiceCapture() {
+  if (voiceBusy || voiceRecorder?.state === "recording") return;
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    voiceTranscriptEl.textContent = "Audio recording is not supported in this browser.";
+    voiceTranscriptEl.hidden = false;
+    return;
+  }
+  stopReplyAudio();
+  window.speechSynthesis?.cancel?.();
+  try {
+    voiceRecorderStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  } catch (e) {
+    console.error("Microphone permission failed", e);
+    voiceTranscriptEl.textContent = "Mic permission denied. Allow microphone access, then try again.";
+    voiceTranscriptEl.hidden = false;
+    return;
+  }
+
+  voiceChunks = [];
+  const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+    ? "audio/webm;codecs=opus"
+    : "audio/webm";
+  voiceRecorder = new MediaRecorder(voiceRecorderStream, { mimeType });
+  voiceRecorder.ondataavailable = (ev) => {
+    if (ev.data?.size) voiceChunks.push(ev.data);
+  };
+  voiceRecorder.onstop = async () => {
+    const chunks = voiceChunks.slice();
+    cleanupVoiceRecorder();
+    resetVoiceButton();
+    if (Date.now() - voiceRecordingStartedAt < 450 || chunks.length === 0) {
+      voiceTranscriptEl.textContent = "No speech caught. Hold the button, speak clearly, then release.";
+      voiceTranscriptEl.hidden = false;
+      return;
+    }
+    voiceBusy = true;
+    voiceTranscriptEl.textContent = "Transcribing...";
+    voiceTranscriptEl.hidden = false;
+    try {
+      const blob = new Blob(chunks, { type: "audio/webm" });
+      const text = await transcribeVoiceBlob(blob);
+      voiceTranscriptEl.textContent = `You: ${text}`;
+      voiceTranscriptEl.hidden = false;
+      if (isSafeModePhrase(text)) {
+        startSafeMode();
+        await runSafeMode(text);
+      } else if (safeModeActive) {
+        await runSafeMode(text);
+      } else {
+        await runChat(text);
+      }
+    } catch (e) {
+      console.error(e);
+      voiceTranscriptEl.textContent = "No speech caught. Hold the button, speak clearly, then release.";
+      voiceTranscriptEl.hidden = false;
+    } finally {
+      voiceBusy = false;
+    }
+  };
+  voiceRecorder.start();
+  voiceRecordingStartedAt = Date.now();
+  voiceBtn.classList.add("recording");
+  voiceBtn.textContent = "Listening...";
+  voiceBtn.setAttribute("aria-pressed", "true");
+  voiceTranscriptEl.textContent = "Listening...";
+  voiceTranscriptEl.hidden = false;
+}
+
+function stopVoiceCapture() {
+  if (!voiceRecorder || voiceRecorder.state !== "recording") return;
+  const elapsed = Date.now() - voiceRecordingStartedAt;
+  const stopNow = () => {
+    if (voiceRecorder?.state === "recording") voiceRecorder.stop();
+  };
+  if (elapsed < 700) setTimeout(stopNow, 700 - elapsed);
+  else stopNow();
 }
 
 async function runChat(text) {
@@ -755,11 +950,7 @@ async function runChat(text) {
     const data = await resp.json();
     voiceResponseEl.textContent = data.response;
     showSummary(data.summary || "", voiceSummaryEl);
-    if (data.audio_b64) {
-      await playAudioB64(data.audio_b64);
-    } else {
-      speak(data.response, { cancel: false });
-    }
+    await speakReply(data.response, data.audio_b64);
     // Spatial-memory: when /chat answers a "where did I see X" or
     // "what's at <location>" query, the response carries a referenced
     // location — switch to the map tab and pulse a pin there.
@@ -778,58 +969,181 @@ async function runChat(text) {
   }
 }
 
-voiceBtn.addEventListener("mousedown", () => {
+async function runVideoSummary(event) {
+  event.preventDefault();
+  const file = videoUploadEl?.files?.[0];
+  if (!file) {
+    videoSummaryStatusEl.textContent = "Choose a video first.";
+    videoSummaryStatusEl.hidden = false;
+    return;
+  }
+
+  videoSummaryBtn.disabled = true;
+  videoSummaryOutputEl.hidden = true;
+  videoSummaryOutputEl.textContent = "";
+  videoSummaryStatusEl.textContent = "Selecting key frames and analyzing video…";
+  videoSummaryStatusEl.hidden = false;
+
+  const formData = new FormData();
+  formData.append("video", file);
+  const startedAt = performance.now();
+  try {
+    const resp = await fetch("/daily-video-summary", {
+      method: "POST",
+      headers: { ...window.getAuthHeaders?.() },
+      body: formData,
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.success) {
+      videoSummaryStatusEl.textContent = data.detail || "Could not summarize this video.";
+      return;
+    }
+    const elapsed = ((performance.now() - startedAt) / 1000).toFixed(1);
+    videoSummaryStatusEl.textContent = `Finished in ${elapsed}s.`;
+    videoSummaryOutputEl.textContent = formatVideoSummary(data);
+    videoSummaryOutputEl.hidden = false;
+    window.refreshHistory?.();
+  } catch (e) {
+    videoSummaryStatusEl.textContent = "Network error while summarizing video.";
+    console.error(e);
+  } finally {
+    videoSummaryBtn.disabled = false;
+  }
+}
+
+function resetVoiceButton() {
+  recognitionActive = false;
+  recognitionStopRequested = false;
+  voiceBtn.classList.remove("recording");
+  voiceBtn.textContent = "Hold to speak";
+  voiceBtn.setAttribute("aria-pressed", "false");
+}
+
+function stopVoiceRecognition() {
+  if (!recognition || !recognitionActive) return;
+  recognitionStopRequested = true;
+  const elapsed = Date.now() - recognitionStartedAt;
+  const stopNow = () => {
+    if (!recognition || !recognitionActive) return;
+    try {
+      recognition.stop();
+    } catch (e) {
+      console.warn("SpeechRecognition stop failed", e);
+      resetVoiceButton();
+    }
+  };
+  if (elapsed < 700) {
+    setTimeout(stopNow, 700 - elapsed);
+  } else {
+    stopNow();
+  }
+}
+
+async function startVoiceRecognition() {
   if (voiceBusy) return;
   if (!SpeechRecognition) {
     voiceTranscriptEl.textContent = "Speech recognition not supported in this browser. Use Chrome.";
     voiceTranscriptEl.hidden = false;
     return;
   }
+  stopReplyAudio();
+  window.speechSynthesis?.cancel?.();
+  const micOk = await ensureMicPermission();
+  if (!micOk) return;
 
   recognition = initRecognition();
+  let finalTranscript = "";
+  let latestTranscript = "";
+  let gotError = false;
+  recognitionStopRequested = false;
   voiceBtn.classList.add("recording");
   voiceBtn.textContent = "Listening…";
   voiceBtn.setAttribute("aria-pressed", "true");
+  voiceTranscriptEl.textContent = "Listening…";
+  voiceTranscriptEl.hidden = false;
 
   recognition.onresult = (ev) => {
-    const text = ev.results[0][0].transcript.trim();
-    if (!text) return;
-    if (isSafeModePhrase(text)) {
-      startSafeMode();
-      runSafeMode(text);
-    } else if (safeModeActive) {
-      runSafeMode(text);
-    } else {
-      runChat(text);
+    let interimTranscript = "";
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const piece = ev.results[i]?.[0]?.transcript || "";
+      if (ev.results[i].isFinal) {
+        finalTranscript += ` ${piece}`;
+      } else {
+        interimTranscript += ` ${piece}`;
+      }
+    }
+    latestTranscript = `${finalTranscript} ${interimTranscript}`.replace(/\s+/g, " ").trim();
+    if (latestTranscript) {
+      voiceTranscriptEl.textContent = `You: ${latestTranscript}`;
+      voiceTranscriptEl.hidden = false;
     }
   };
 
   recognition.onerror = (ev) => {
+    gotError = true;
     console.error("SpeechRecognition error", ev.error);
-    voiceTranscriptEl.textContent = `Mic error: ${ev.error}`;
+    if (ev.error === "aborted" && recognitionStopRequested) {
+      voiceTranscriptEl.textContent = "Listening stopped.";
+      voiceTranscriptEl.hidden = false;
+      return;
+    }
+    const messages = {
+      "not-allowed": "Mic permission denied. Allow microphone access, then try again.",
+      "service-not-allowed": "Speech recognition is blocked in this browser. Try Chrome permissions.",
+      "audio-capture": "No microphone was found.",
+      "no-speech": "I didn't catch speech. Hold the button and speak after it says Listening.",
+      network: "Speech recognition network error. Try again.",
+      aborted: "Speech input was interrupted. Hold the button, speak, then release.",
+    };
+    voiceTranscriptEl.textContent = messages[ev.error] || `Mic error: ${ev.error}`;
     voiceTranscriptEl.hidden = false;
   };
 
   recognition.onend = () => {
-    voiceBtn.classList.remove("recording");
-    voiceBtn.textContent = "Hold to speak";
-    voiceBtn.setAttribute("aria-pressed", "false");
+    resetVoiceButton();
+    const text = (finalTranscript || latestTranscript).replace(/\s+/g, " ").trim();
+    if (text) {
+      voiceTranscriptEl.textContent = `You: ${text}`;
+      voiceTranscriptEl.hidden = false;
+      if (isSafeModePhrase(text)) {
+        startSafeMode();
+        runSafeMode(text);
+      } else if (safeModeActive) {
+        runSafeMode(text);
+      } else {
+        runChat(text);
+      }
+    } else if (!gotError) {
+      voiceTranscriptEl.textContent = "No speech caught. Hold the button, speak clearly, then release.";
+      voiceTranscriptEl.hidden = false;
+    }
   };
 
-  recognition.start();
-});
+  try {
+    recognition.start();
+    recognitionActive = true;
+    recognitionStartedAt = Date.now();
+  } catch (e) {
+    console.error("SpeechRecognition start failed", e);
+    voiceTranscriptEl.textContent = "Mic could not start. Check browser microphone permission.";
+    voiceTranscriptEl.hidden = false;
+    resetVoiceButton();
+  }
+}
 
-voiceBtn.addEventListener("mouseup", () => recognition?.stop());
-voiceBtn.addEventListener("mouseleave", () => recognition?.stop());
+voiceBtn.addEventListener("mousedown", startVoiceCapture);
+
+voiceBtn.addEventListener("mouseup", stopVoiceCapture);
+window.addEventListener("mouseup", stopVoiceCapture);
 
 // Touch-event parallels for mobile. preventDefault on touchstart suppresses
 // the synthesized mousedown so the handler doesn't fire twice.
 voiceBtn.addEventListener("touchstart", (e) => {
   e.preventDefault();
-  voiceBtn.dispatchEvent(new MouseEvent("mousedown"));
+  startVoiceCapture();
 }, { passive: false });
-voiceBtn.addEventListener("touchend",    () => recognition?.stop());
-voiceBtn.addEventListener("touchcancel", () => recognition?.stop());
+voiceBtn.addEventListener("touchend",    stopVoiceCapture);
+voiceBtn.addEventListener("touchcancel", stopVoiceCapture);
 
 // ---------------- Wiring ----------------
 autoBtn.addEventListener("click", () => {
@@ -844,6 +1158,7 @@ safeModeBtn?.addEventListener("click", () => {
 
 describeBtn.addEventListener("click", () => runInvestigation("_describe"));
 changeBtn.addEventListener("click", () => runChangeAnalysis());
+videoSummaryForm?.addEventListener("submit", runVideoSummary);
 
 // ---------------- Boot ----------------
 (async () => {
@@ -861,26 +1176,7 @@ changeBtn.addEventListener("click", () => runChangeAnalysis());
     return;
   }
 
-  // Auto-capture is the default running state. We only auto-start for
-  // already-authenticated users so the loop doesn't fire requests while the
-  // auth overlay is still gating the app on first visit.
-  if (localStorage.getItem("aeyez_token")) {
-    startAutoCapture({ silent: true });
-  } else {
-    setStatus("Sign in to begin.");
-  }
-
-  // Pick up fresh logins without modifying auth.js: when the auth overlay
-  // closes (auth.js flips appView.hidden from true → false), kick the loop
-  // on if it isn't already running.
-  const appView = document.getElementById("app-view");
-  if (appView) {
-    new MutationObserver(() => {
-      if (!appView.hidden && autoCaptureTimer === null && localStorage.getItem("aeyez_token")) {
-        startAutoCapture({ silent: true });
-      }
-    }).observe(appView, { attributes: true, attributeFilter: ["hidden"] });
-  }
+  setStatus(localStorage.getItem("aeyez_token") ? "Ready." : "Sign in to begin.");
 
   initCalibration();
 })();
