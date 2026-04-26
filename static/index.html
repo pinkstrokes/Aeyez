@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0c0d10" />
+  <title>Aeyez — auto scene narration</title>
+  <link rel="manifest" href="/static/manifest.webmanifest" />
+  <link rel="icon" type="image/svg+xml" href="/static/icons/icon.svg" />
+  <link rel="apple-touch-icon" href="/static/icons/icon.svg" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT,WONK@0,9..144,300..900,0..100,0..1;1,9..144,300..900,0..100,0..1&display=swap" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+</head>
+<body>
+
+  <a href="#right-app" class="skip-link">Skip to main content</a>
+
+  <!-- Splash screen -->
+  <div id="splash-screen" aria-hidden="true">
+    <h1 class="splash-logo">Aeyez</h1>
+    <p class="splash-sub">A camera that narrates what you can't see.</p>
+  </div>
+
+  <!-- Auth overlay -->
+  <div id="auth-overlay" role="dialog" aria-modal="true" aria-labelledby="auth-heading">
+    <div id="auth-card">
+      <h2 id="auth-heading">Aeyez</h2>
+      <p class="auth-tagline">Sign in to track your history.</p>
+      <div id="auth-tabs" role="tablist" aria-label="Sign in or register">
+        <button class="auth-tab active" data-tab="login" role="tab" aria-selected="true" id="auth-tab-login" aria-controls="auth-form">Login</button>
+        <button class="auth-tab" data-tab="register" role="tab" aria-selected="false" id="auth-tab-register" aria-controls="auth-form">Register</button>
+      </div>
+      <form id="auth-form" autocomplete="on">
+        <input id="auth-username" type="text"     placeholder="Username" autocomplete="username"          required />
+        <input id="auth-password" type="password" placeholder="Password" autocomplete="current-password" required />
+        <button id="auth-submit" type="submit" class="primary">Login</button>
+      </form>
+      <p id="auth-error" class="auth-error" role="alert" hidden></p>
+    </div>
+  </div>
+
+  <!-- Fixed corner user menu -->
+  <div id="user-menu-wrap" hidden>
+    <button id="user-menu-btn" class="corner-btn" aria-label="User menu" aria-expanded="false" aria-haspopup="menu" aria-controls="user-dropdown">
+      <span id="corner-avatar" aria-hidden="true">?</span>
+    </button>
+    <div id="user-dropdown" role="menu" aria-labelledby="user-menu-btn">
+      <p id="corner-user-name" class="dropdown-name"></p>
+      <button id="profile-btn" role="menuitem">Profile</button>
+      <button id="logout-btn" role="menuitem">Logout</button>
+    </div>
+  </div>
+
+  <main>
+    <div id="app-view">
+
+      <!-- Left: camera / map tabs -->
+      <div id="left-col">
+        <header>
+          <h1>Aeyez</h1>
+          <p class="tagline">A camera that narrates what you can't see.</p>
+          <div id="left-tabs" role="tablist" aria-label="View">
+            <button id="tab-camera" class="left-tab active" role="tab" aria-selected="true" aria-controls="camera-section" tabindex="0">Camera</button>
+            <button id="tab-map"    class="left-tab"        role="tab" aria-selected="false" aria-controls="map-section"    tabindex="-1">Map</button>
+          </div>
+        </header>
+
+        <div id="camera-section" role="tabpanel" aria-labelledby="tab-camera">
+          <video id="camera" autoplay muted playsinline aria-label="Live camera preview"></video>
+          <canvas id="capture-canvas" hidden></canvas>
+          <img id="last-frame" alt="" hidden />
+        </div>
+
+        <div id="map-section" role="tabpanel" aria-labelledby="tab-map" hidden>
+          <div id="map"></div>
+        </div>
+
+        <footer>
+          <p class="muted">Buffers every 1.0 s · No frames stored · Vision via Spaz</p>
+        </footer>
+      </div>
+
+      <!-- Right: swappable panels -->
+      <div id="right-col">
+
+        <!-- App panel -->
+        <div id="right-app">
+          <section id="status-card" aria-labelledby="status-label">
+            <p class="status-label" id="status-label">Status</p>
+            <p id="status-text" class="status-text" role="status" aria-live="polite" aria-atomic="true">Initializing…</p>
+            <p id="response-text" class="response-text" role="status" aria-live="polite" aria-atomic="true" hidden></p>
+            <p id="summary-text" class="summary-text" hidden></p>
+            <p id="latency-chip" class="latency-chip" hidden></p>
+          </section>
+
+          <section id="controls" aria-label="Capture controls">
+            <button id="auto-btn" class="primary" aria-pressed="false" disabled>Start auto-capture</button>
+            <button id="describe-btn" disabled>Describe surroundings</button>
+            <button id="change-btn" disabled>What changed?</button>
+            <button id="safe-mode-btn" aria-pressed="false" disabled>Safe mode</button>
+          </section>
+
+          <section id="voice-chat-card" aria-labelledby="voice-label">
+            <p class="status-label" id="voice-label">Voice chat</p>
+            <button id="voice-btn" class="primary" aria-pressed="false" aria-label="Hold to speak">Hold to speak</button>
+            <p id="voice-transcript" class="transcript-text" role="status" aria-live="polite" hidden></p>
+            <p id="voice-response" class="response-text" role="status" aria-live="polite" hidden></p>
+            <p id="voice-summary" class="summary-text" hidden></p>
+          </section>
+
+          <details id="history-panel" open>
+            <summary>History</summary>
+            <div id="place-suggest" class="place-suggest" hidden>
+              <p class="place-suggest-text">
+                You've been here a few times.
+                <span id="place-suggest-count"></span>
+                Name this place?
+              </p>
+              <form id="place-suggest-form" class="inline-form">
+                <input id="place-suggest-name" type="text" placeholder='e.g. "Home"' autocomplete="off" />
+                <button type="submit" class="primary">Save</button>
+                <button type="button" id="place-suggest-dismiss" class="back-btn">Not now</button>
+              </form>
+            </div>
+            <div id="history-filter-bar">
+              <select id="history-location-filter">
+                <option value="">All locations</option>
+              </select>
+            </div>
+            <div id="history-list"><p class="muted history-empty">No history yet.</p></div>
+          </details>
+
+          <details id="calibration-panel">
+            <summary>Calibration</summary>
+            <div class="calib-row">
+              <label for="threshold-slider">Change threshold</label>
+              <input type="range" id="threshold-slider" min="0" max="30" step="0.5" />
+              <span id="threshold-value" class="calib-readout">8.0</span>
+            </div>
+            <p class="calib-meta">
+              Last diff: <span id="last-diff" class="calib-readout">—</span>
+              <span class="muted calib-hint">(silent below threshold)</span>
+            </p>
+          </details>
+        </div>
+
+        <!-- Profile panel (hidden by default via CSS) -->
+        <div id="right-profile">
+          <button id="back-btn" class="back-btn">← Back</button>
+
+          <div class="profile-hero">
+            <div class="avatar" id="profile-avatar">?</div>
+            <div class="profile-info">
+              <h2 id="profile-display-name-text">—</h2>
+              <p class="muted" id="profile-username-text"></p>
+              <p class="muted" id="profile-stats-text"></p>
+            </div>
+          </div>
+
+          <div class="profile-card">
+            <h3 class="section-heading">Display name</h3>
+            <form id="display-name-form" class="inline-form">
+              <input id="edit-display-name" type="text" placeholder="Display name" autocomplete="off" />
+              <button type="submit" class="primary">Save</button>
+            </form>
+            <p id="display-name-msg" class="form-msg" hidden></p>
+          </div>
+
+          <div class="profile-card">
+            <h3 class="section-heading">Change password</h3>
+            <form id="password-form" class="stack-form">
+              <input id="current-password" type="password" placeholder="Current password"      autocomplete="current-password" />
+              <input id="new-password"     type="password" placeholder="New password (≥4 chars)" autocomplete="new-password" />
+              <button type="submit" class="primary">Update password</button>
+            </form>
+            <p id="password-msg" class="form-msg" hidden></p>
+          </div>
+
+          <div class="profile-card" id="locations-card">
+            <h3 class="section-heading">Saved locations</h3>
+            <form id="save-location-form" class="inline-form">
+              <input id="location-name-input" type="text" placeholder='e.g. "Home"' autocomplete="off" />
+              <button type="submit" class="primary" id="save-location-btn" disabled>Save here</button>
+            </form>
+            <p id="location-msg" class="form-msg" hidden></p>
+            <ul id="locations-list" class="locations-list"></ul>
+          </div>
+        </div>
+
+      </div><!-- #right-col -->
+    </div><!-- #app-view -->
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="/static/clip_buffer.js"></script>
+  <script src="/static/auth.js"></script>
+  <script src="/static/map.js"></script>
+  <script src="/static/app.js" type="module"></script>
+</body>
+</html>

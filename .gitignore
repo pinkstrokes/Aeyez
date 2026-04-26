@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+.DS_Store
+*.log
+
+# SQLite databases — local data, never tracked.
+# Note: aeyes.db remains in git history from prior commits; use `git filter-repo`
+# to scrub it if the legacy dev accounts there are sensitive.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Test artifacts
+.pytest_cache/
+.playwright-cli/
+.coverage
+htmlcov/
+
+# Runtime output
+logs/
+
+# mkcert-issued local TLS material — per-machine, per-LAN-IP, never tracked.
+certs/
