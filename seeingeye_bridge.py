@@ -28,6 +28,7 @@ def _candidate_roots() -> list[Path]:
     candidates: list[Path] = []
     if env_path:
         candidates.append(Path(env_path).expanduser())
+    candidates.append((Path(__file__).resolve().parent / "Spaz").resolve())
     candidates.append((Path(__file__).resolve().parent.parent / "Spaz").resolve())
     candidates.append((Path(__file__).resolve().parent.parent / "seeingeye").resolve())
     return candidates
@@ -86,6 +87,23 @@ def _require_runtime():
     return run_question
 
 
+def _require_runner_module():
+    if not STATUS.available or STATUS.root is None:
+        raise SpazUnavailableError(STATUS.reason or "Spaz is unavailable.")
+    if str(STATUS.root) not in sys.path:
+        sys.path.insert(0, str(STATUS.root))
+    _load_env_file(STATUS.root / ".env")
+    _mirror_spaz_env_to_runtime()
+    try:
+        from src.seeingeye.runtime import runner  # type: ignore
+        from src.seeingeye.observability.logging import configure_logging  # type: ignore
+        from src.seeingeye.runtime.result import SeeingEyeResult  # type: ignore
+        from src.seeingeye.state.sir import SIR  # type: ignore
+    except Exception as exc:  # pragma: no cover - exercised only on broken installs
+        raise SpazUnavailableError(f"Failed to import Spaz runtime: {exc}") from exc
+    return runner, configure_logging, SeeingEyeResult, SIR
+
+
 def _strip_data_url(value: str) -> tuple[bytes, str]:
     payload = value.strip()
     mime_type = "image/jpeg"
@@ -97,6 +115,15 @@ def _strip_data_url(value: str) -> tuple[bytes, str]:
         return base64.b64decode(payload, validate=False), mime_type
     except Exception as exc:
         raise ValueError("Invalid base64 image payload.") from exc
+
+
+def _frame_from_b64(frame_b64: str, timestamp_s: float) -> dict:
+    frame_bytes, mime_type = _strip_data_url(frame_b64)
+    return {
+        "b64": base64.b64encode(frame_bytes).decode("ascii"),
+        "timestamp_s": round(timestamp_s, 3),
+        "mime_type": mime_type,
+    }
 
 
 def _image_suffix(mime_type: str) -> str:
@@ -116,41 +143,6 @@ def _write_temp_image(image_b64: str, directory: str, stem: str) -> Path:
     return path
 
 
-def _write_temp_video(frames_b64: Iterable[str], directory: str) -> Path:
-    import cv2  # type: ignore[import-not-found]
-    import numpy as np  # type: ignore[import-not-found]
-
-    decoded_frames = []
-    for frame_b64 in frames_b64:
-        frame_bytes, _mime_type = _strip_data_url(frame_b64)
-        arr = np.frombuffer(frame_bytes, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if frame is None:
-            raise ValueError("Could not decode one of the provided frames.")
-        decoded_frames.append(frame)
-    if not decoded_frames:
-        raise ValueError("At least one frame is required.")
-
-    height, width = decoded_frames[0].shape[:2]
-    video_path = Path(directory) / "frames.mp4"
-    writer = cv2.VideoWriter(
-        str(video_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        1.0,
-        (width, height),
-    )
-    if not writer.isOpened():
-        raise ValueError("Could not create temporary video for Spaz.")
-    try:
-        for frame in decoded_frames:
-            if frame.shape[:2] != (height, width):
-                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-            writer.write(frame)
-    finally:
-        writer.release()
-    return video_path
-
-
 async def run_on_image(question: str, image_b64: str):
     run_question = _require_runtime()
     with tempfile.TemporaryDirectory(prefix="aeyez-spaz-") as tmpdir:
@@ -159,20 +151,39 @@ async def run_on_image(question: str, image_b64: str):
 
 
 async def run_on_frames(question: str, frames_b64: Iterable[str]):
-    run_question = _require_runtime()
     frames = [frame for frame in frames_b64 if frame]
     if not frames:
         raise ValueError("At least one frame is required.")
     if len(frames) == 1:
         return await run_on_image(question, frames[0])
-    with tempfile.TemporaryDirectory(prefix="aeyez-spaz-") as tmpdir:
-        video_path = _write_temp_video(frames, tmpdir)
-        return await run_question(
-            question=question,
-            video_path=video_path,
-            frame_interval_s=1.0,
-            frame_selection="uniform",
-        )
+
+    runner, configure_logging, SeeingEyeResult, SIR = _require_runner_module()
+    configure_logging()
+    image_frames = [
+        _frame_from_b64(frame_b64, timestamp_s=index * 1.5)
+        for index, frame_b64 in enumerate(frames)
+    ]
+    graph = runner._get_graph()
+    initial_state = {
+        "sir": SIR(content=""),
+        "outer_iter": 0,
+        "question": question,
+        "options": None,
+        "media_type": "video",
+        "image_b64": None,
+        "image_frames": image_frames,
+        "translator_messages": [],
+        "reasoner_messages": [],
+        "reasoner_feedback": None,
+        "final_answer": None,
+    }
+    final_state = await graph.ainvoke(initial_state, config={"recursion_limit": 50})
+    return SeeingEyeResult(
+        answer=final_state.get("final_answer") or "",
+        sir=final_state["sir"],
+        outer_iters_used=final_state.get("outer_iter", 0),
+        total_tokens=runner._sum_total_tokens(final_state),
+    )
 
 
 def run_sync(coro):

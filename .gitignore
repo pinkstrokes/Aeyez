@@ -24,5 +24,11 @@ htmlcov/
 # Runtime output
 logs/
 
+# Accidental nested clones
+Aeyez/
+
+# Internal migration notes; not needed for runtime and may contain old private context.
+Spaz/.planning/
+
 # mkcert-issued local TLS material — per-machine, per-LAN-IP, never tracked.
 certs/

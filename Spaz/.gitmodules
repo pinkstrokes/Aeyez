@@ -1,0 +1,3 @@
+[submodule "external/ml-mia-bench"]
+	path = external/ml-mia-bench
+	url = https://github.com/apple/ml-mia-bench

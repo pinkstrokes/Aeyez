@@ -1,0 +1,1 @@
+python src/multi-agent/benchmark_evaluation/ocrbench/infer_ocrbench_flow.py --data-source src/multi-agent/benchmark_evaluation/ocrbench/ocrbench_local_data.json  --streaming --vision-port 8000 --text-port 8001

@@ -101,9 +101,11 @@ aren't recorded.
 pip install -r requirements.txt
 ```
 
-You also need a local Spaz checkout. By default the bridge looks for:
+The Spaz runtime is bundled in this repo under `./Spaz`. The bridge looks in
+this order:
 
 ```text
+./Spaz
 ../Spaz
 ```
 

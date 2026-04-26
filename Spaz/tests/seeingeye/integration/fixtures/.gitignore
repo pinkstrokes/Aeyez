@@ -1,0 +1,5 @@
+# Integration test fixtures are committed by exception — they are required
+# for GRF-05 and are too small to be a regen burden. Override the top-level
+# *.jpg ignore here.
+!*.jpg
+!*.png

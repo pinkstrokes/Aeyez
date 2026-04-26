@@ -1,0 +1,39 @@
+# SeeingEye default configuration
+# NO API keys in this file — credentials are env-var only (D-04)
+
+translator_base_url = "https://api.openai.com/v1"
+reasoner_base_url = "https://api.openai.com/v1"
+translator_model = "gpt-5.4-mini"
+translator_escalation_model = "gpt-5.4-mini"
+reasoner_model = "gpt-5.4-mini"
+
+# Paper hyperparameters (Section 4.1)
+max_iters = 3
+n_t = 3
+n_r = 3
+
+# vLLM sampling params (identical for both endpoints)
+temperature = 0.01
+top_p = 0.001
+top_k = 1
+repetition_penalty = 1.1
+max_tokens = 4096
+
+# Video frame sampling
+video_frame_interval_s = 0.5
+video_max_frames = 64
+video_frame_selection = "change"
+video_scene_change_threshold = 6.0
+video_reasoning_framework = "RSTR"
+
+# Safety analysis mode
+analysis_mode = "default"
+safety_framework = "OSHA"
+safety_prediction_horizon = "near-term"
+safety_navigation_schema = "dynamic_route_v1"
+safety_scan_prompt = "Please inspect the nearby area for hazards and identify the safest next action."
+
+# Observability
+langsmith_tracing = false
+safety_event_log_enabled = true
+safety_event_log_path = "logs/safety_events.jsonl"
