@@ -1,14 +1,14 @@
-# Aeyez — Auto-Capture Visual Narration
+# Aeyez — Auto-Capture Visual Safety Narration
 
-A hackathon-style web demo that helps blind users understand what's in front
-of the camera. The browser captures a still every 5 seconds (or on demand),
-sends it to the underlying
-[Spaz](./Spaz/README.md) multi-agent
-pipeline for description, and reads the answer aloud. Two complementary
-on-demand modes: **"What just changed?"** compares two frames sampled ~10 s
-apart, and **"Hold to speak"** lets the user ask follow-up questions by voice.
-Logged-in users get persistent per-account history that's fed back to the
-model as memory.
+A tested web app that helps blind or low-vision users understand what is in
+front of the camera, what changed, and what hazards may affect the safest next
+move. The browser captures a still every 5 seconds (or on demand), sends it to
+the bundled [Spaz](./Spaz/README.md) multi-agent pipeline for description, and
+reads the answer aloud. **"What just changed?"** compares two frames sampled
+~10 s apart, **"Safe mode"** asks for immediate route and hazard guidance, and
+**"Hold to speak"** lets the user ask follow-up questions by voice. Logged-in
+users get persistent per-account history that is fed back to the model as
+memory.
 
 ## Why no audio detection?
 
@@ -27,6 +27,21 @@ perceived.
 > auth, profile, and history all stay in place. ElevenLabs TTS for `/chat` is
 > still real when `ELEVENLABS_API_KEY` is set; otherwise the browser falls back
 > to `speechSynthesis`.
+
+## Measured results
+
+These numbers are from local Aeyez / Spaz runs, not from a paper claim or
+mocked demo output.
+
+| Evaluation | Result | Notes |
+|---|---:|---|
+| MMMU custom hardset | **220 / 250 correct = 88.0%** | Open-answer adjusted result recorded in [`benchmark_results/mmmutest.jsonl`](./benchmark_results/mmmutest.jsonl). |
+| Long construction-video safety summaries | timestamped hazard tables + route guidance | Tested on masonry-site videos with 30 s windows, OpenCV keyframe selection, local risk rescans, and safe-mode escalation for high/uncertain windows. |
+
+The MMMU hardset is curated toward the skills Aeyez needs in real scenes:
+spatial relationships, route and obstruction reasoning, engineering/mechanics
+visual verification, candidate-shape comparison, crop/zoom search, and
+safety-relevant scene understanding.
 
 ## Architecture
 
@@ -47,7 +62,9 @@ camera → ClipBuffer  ─10 s rolling window of JPEGs                     │
                   └─ above → /analyze-change {prev, current}     ─→  Spaz
                               (first tick: /investigate _describe)─→  Spaz
    "What changed?" → /analyze-change {frame0, frame1}        ─────→  Spaz
+   "Safe mode"     → /safe-mode {recent frames}              ─────→  Spaz safety analysis
    "Hold to speak" → /chat {text + recent frames}            ─────→  Spaz + ElevenLabs MP3
+   video upload    → /daily-video-summary                    ─────→  OpenCV keyframes + Spaz
               │                                                        │
               │   each successful request appends to                   ▼
               │   ─────────────────────────────────────────→  SQLite (history)
@@ -67,9 +84,9 @@ the sampling policy:
 
 | Strategy | Returns | Used by |
 |---|---|---|
-| `latest` | newest frame | (available; any future "describe what's now" path) |
+| `latest` | newest frame | on-demand current-scene descriptions |
 | `edges` | `[oldest, newest]` | `/analyze-change` |
-| `uniform` | N evenly spaced frames across the window | reserved for future multi-image investigate |
+| `uniform` | N evenly spaced frames across the window | `/chat`, `/safe-mode`, and multi-frame context |
 
 Adding a new strategy (e.g. perceptual-hash dedup, motion keyframes) is a local
 edit to `ClipBuffer.sample()` — no orchestration changes needed.
@@ -148,7 +165,7 @@ uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                     # 41 tests, ~12 s
+pytest                                     # 19 tests, ~12 s on the current branch
 pytest --cov=server --cov=auth --cov=database --cov-report=term
 ```
 
@@ -275,6 +292,8 @@ python -m vllm.entrypoints.openai.api_server \
 | POST | `/investigate` | optional | Single-frame Spaz description. Saves history when authenticated. |
 | POST | `/analyze-change` | optional | Multi-frame Spaz comparison. Saves history when authenticated. |
 | POST | `/chat` | optional | Voice question → text reply + optional ElevenLabs MP3. Saves history when authenticated. |
+| POST | `/safe-mode` | optional | Safety-focused route, obstruction, and hazard guidance from recent frames. Saves history when authenticated. |
+| POST | `/daily-video-summary` | optional | Uploaded long-video analysis with OpenCV keyframe selection, risk rescans, timestamped hazards, and final summary. Saves history when authenticated. |
 | GET | `/health` | none | Liveness + Spaz availability/path. |
 
 ## Demo plan (stage-day)
@@ -316,11 +335,15 @@ python -m vllm.entrypoints.openai.api_server \
 - `EVENT_PROMPTS` (backend, `server.py`): per-event investigative prompts
   used before frames are sent to Spaz.
 - `_build_context(...)` (backend, `server.py`): formats recent history into
-  a prompt prefix that will be injected into the real model once integrated,
-  giving it memory of past observations.
+  a prompt prefix for live model calls, giving the model memory of past
+  observations.
 - `_EXPIRY_HOURS` (backend, `auth.py`): JWT lifetime, default 24 h.
-- `SEEINGEYE_VIDEO_FRAME_INTERVAL_S` / `SEEINGEYE_VIDEO_MAX_FRAMES`: Spaz
-  video-frame sampling controls for longer clips.
+- `/daily-video-summary` (backend, `server.py` + `video_analysis.py`): uses a
+  tested two-stage video path: 5 baseline frames/min for the global timeline,
+  30 s local windows, 64x64 grayscale OpenCV frame-difference scoring, local
+  risk rescans, and denser frame sampling around high/uncertain risk windows.
+- `SEEINGEYE_VIDEO_FRAME_INTERVAL_S` / `SEEINGEYE_VIDEO_MAX_FRAMES`: lower-level
+  Spaz CLI/API video-frame sampling controls.
 
 ## File map
 
@@ -331,6 +354,7 @@ python -m vllm.entrypoints.openai.api_server \
 | `auth.py` | bcrypt password hashing + PyJWT token issuance/verification. `require_user` and `optional_user` dependencies. |
 | `database.py` | aiosqlite wrappers for users (id, username, password_hash, display_name) and history (type, event, input, response, timestamp). Auto-creates schema on startup. |
 | `Spaz/` | Bundled multimodal reasoning runtime and tests. Runtime secrets are intentionally not committed. |
+| `benchmark_results/` | Measured local validation artifacts, including the 250-question MMMU custom hardset result at 88.0%. |
 | `requirements.txt` | Aeyez web dependencies plus `Spaz/requirements.txt` for the live model bridge. |
 | `static/index.html` | Auth overlay, two-column layout (camera left, app/profile right), corner user menu. |
 | `static/app.js` | Camera init, ClipBuffer wiring, 5 s auto-capture loop, manual buttons, voice chat (`SpeechRecognition` → `/chat` → ElevenLabs audio), TTS, fetch + Bearer auth + cache pruning. |

@@ -21,6 +21,12 @@ is now `src/seeingeye/`.
 > MMMU-Pro vis 33.33%, OCR-BenchV2 33.99%, MIA-Bench 84.10%). See
 > [SECURITY.md](./SECURITY.md) for the full risk-acceptance record.
 
+> **Aeyez local validation:** the parent Aeyez app includes a measured
+> 250-question MMMU custom hardset run at **220 / 250 correct = 88.0%**.
+> That artifact is stored at
+> [`../benchmark_results/mmmutest.jsonl`](../benchmark_results/mmmutest.jsonl)
+> and is separate from the original paper leaderboard numbers above.
+
 ## Quick Start
 
 **Default configuration:** OpenAI-compatible API with `gpt-5.4-mini` as the
