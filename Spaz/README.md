@@ -1,6 +1,7 @@
-# SeeingEye — LangGraph Implementation
+# Spaz — SeeingEye-Inspired LangGraph Runtime
 
-A LangGraph rebuild of the SeeingEye flow (Zhang et al., UIUC, arXiv
+Aeyez uses Spaz as a SeeingEye-inspired multimodal reasoning runtime. It began
+as a LangGraph rebuild of the SeeingEye flow (Zhang et al., UIUC, arXiv
 [2510.25092](https://arxiv.org/abs/2510.25092), Oct 2025) — a modular
 framework that unlocks multimodal reasoning in text-only LLMs by decoupling
 perception (a small VLM Translator Agent) from reasoning (a text-only LLM

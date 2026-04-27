@@ -10,6 +10,11 @@ reads the answer aloud. **"What just changed?"** compares two frames sampled
 users get persistent per-account history that is fed back to the model as
 memory.
 
+Aeyez is inspired by the SeeingEye agentic visual-reasoning architecture. The
+project extends that idea toward first-person safety assistance: route
+understanding, obstruction tracking, long-video hazard summaries, and
+actionable next-step guidance for real environments.
+
 ## Why no audio detection?
 
 An earlier version listened for environmental sounds (glass breaking, alarms,
