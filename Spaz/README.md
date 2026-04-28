@@ -14,6 +14,11 @@ semantics. The old OpenManus-derived implementation (`src/multi-agent/`)
 was deleted in Phase 7 (2026-04-17); the sole authoritative implementation
 is now `src/seeingeye/`.
 
+Credit and lineage: this runtime is explicitly derived from the SeeingEye
+architecture and paper. Aeyez uses it as the technical backbone for a
+real-world assistive product, while preserving clear attribution to the
+original SeeingEye research direction.
+
 > **Reproducibility status (v1.0, 2026-04-17):** Phase 6 parity validation
 > was **deferred to post-migration**. The tree is code-complete with 146
 > structural tests passing (plus 1 integration test skipped pending a live

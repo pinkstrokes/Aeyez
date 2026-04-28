@@ -15,6 +15,15 @@ project extends that idea toward first-person safety assistance: route
 understanding, obstruction tracking, long-video hazard summaries, and
 actionable next-step guidance for real environments.
 
+## Attribution
+
+Aeyez credits the original SeeingEye work for the core agentic visual-reasoning
+idea: decoupled perception and reasoning, a structured intermediate
+representation, and feedback between vision and reasoning passes. This project
+builds on that foundation for blind and low-vision assistance, with a product
+focus on first-person navigation, hazard identification, safe-route guidance,
+and long-video safety summaries.
+
 ## Why no audio detection?
 
 An earlier version listened for environmental sounds (glass breaking, alarms,
