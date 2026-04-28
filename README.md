@@ -237,9 +237,38 @@ JWT_SECRET=$(openssl rand -hex 32) docker compose up --build
 
 The image runs in `AEYEZ_ENV=prod` mode and refuses to start without a real
 `JWT_SECRET`. SQLite is stored in a named volume (`aeyez-data:/app/data`) so
-data survives `down`/`up`. A commented-out `caddy` service stub in
-`docker-compose.yml` is the recommended TLS termination path for any public
-deploy.
+data survives `down`/`up`.
+
+### Public deploy for `aeyez.vision`
+
+The checked-in [`docker-compose.yml`](/Users/pinkstrokes/Documents/New%20project/Aeyez/docker-compose.yml)
+and [`Caddyfile`](/Users/pinkstrokes/Documents/New%20project/Aeyez/Caddyfile)
+are ready for a public deploy with automatic HTTPS.
+
+Before you start:
+
+1. Point the DNS for `aeyez.vision` at your server.
+2. Open inbound ports `80` and `443` on the server.
+3. Fill a real `.env` with at least:
+
+```bash
+AEYEZ_DOMAIN=aeyez.vision
+JWT_SECRET=replace_with_a_long_random_value
+OPENAI_API_KEY=your_openai_api_key_here
+SEEINGEYE_TRANSLATOR_MODEL=gpt-5.4-mini
+SEEINGEYE_TRANSLATOR_ESCALATION_MODEL=gpt-5.4-mini
+SEEINGEYE_REASONER_MODEL=gpt-5.4-mini
+```
+
+Then launch:
+
+```bash
+docker compose up -d --build
+```
+
+`Caddy` terminates TLS for `https://aeyez.vision` and proxies traffic to the
+internal `aeyez:8000` service. The app container is no longer published
+directly on host port `8000`; public traffic should go through `Caddy`.
 
 ### Accessibility
 

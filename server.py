@@ -92,23 +92,6 @@ _OPENAI_TRANSCRIBE_MODEL = os.environ.get("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-min
 _GMAPS_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
 _AEYEZ_ENV = os.environ.get("AEYEZ_ENV") or os.environ.get("AEYES_ENV") or "dev"
 _IS_PROD = _AEYEZ_ENV == "prod"
-_K2_API_KEY = (
-    os.environ.get("K2_API_KEY")
-    or os.environ.get("AEYEZ_SUMMARIZER_API_KEY")
-    or os.environ.get("AEYES_SUMMARIZER_API_KEY")
-    or ""
-).strip()
-_K2_BASE_URL = (
-    os.environ.get("K2_BASE_URL")
-    or os.environ.get("AEYEZ_SUMMARIZER_BASE_URL")
-    or os.environ.get("AEYES_SUMMARIZER_BASE_URL")
-    or "https://api.k2think.ai/v1"
-).rstrip("/")
-_K2_SUMMARIZER_MODEL = (
-    os.environ.get("AEYEZ_SUMMARIZER_MODEL")
-    or os.environ.get("AEYES_SUMMARIZER_MODEL")
-    or "k2thinkv2"
-).strip()
 
 _MATCH_RADIUS_METERS = 100
 _DAILY_VIDEO_MAX_SECONDS = 30 * 60
@@ -207,93 +190,18 @@ async def _elevenlabs_tts(text: str) -> Optional[str]:
     return base64.b64encode(r.content).decode()
 
 
-async def _summarize_with_k2(text: str) -> Optional[str]:
-    """Return a short k2thinkv2 summary for the generated output, or None."""
-    if not _K2_API_KEY or not text.strip():
-        return None
-    prompt = (
-        "Summarize the following visual-assistant output for a blind user in one short sentence. "
-        "Keep only the most actionable takeaway, under 12 words, and do not add preamble.\n\n"
-        f"Output:\n{text.strip()}"
-    )
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                f"{_K2_BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {_K2_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": _K2_SUMMARIZER_MODEL,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You compress assistant outputs into crisp, practical summaries.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": 60,
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-        message = data["choices"][0]["message"]["content"]
-    except Exception:
-        return None
-    summary = (message or "").strip()
-    return summary or None
-
-
 async def _final_spoken_with_k2(
     model_output: str,
     *,
     user_text: Optional[str] = None,
     mode: str = "visual answer",
 ) -> Optional[str]:
-    """Compress a full SeeingEye/Spaz answer into the final text we show and speak."""
-    if not _K2_API_KEY or not model_output.strip():
+    """Return the runtime output directly now that K2 post-processing is disabled."""
+    _ = (user_text, mode)
+    text = (model_output or "").strip()
+    if not text:
         return None
-    user_line = f"\nUser question: {user_text.strip()}" if user_text else ""
-    prompt = (
-        "Rewrite the visual model output as the final answer that will be read aloud. "
-        "Make it short and sharp, but do not omit any concrete safety or navigation detail. "
-        "Preserve every hazard, location, direction, object/person, visible text, timestamp, "
-        "and recommended action from the original. Remove filler, uncertainty hedging, and repeated wording. "
-        "Lead with danger/action if present. Target 1-2 compact sentences; use semicolons if needed "
-        "to keep multiple details without making it long. Do not add facts.\n\n"
-        f"Mode: {mode}{user_line}\n\n"
-        f"Visual model output:\n{model_output.strip()}"
-    )
-    try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            response = await client.post(
-                f"{_K2_BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {_K2_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": _K2_SUMMARIZER_MODEL,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a final speech editor for a blind-assistance camera. "
-                                "Compress aggressively while preserving all concrete details."
-                            ),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": 140,
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-        final = (data["choices"][0]["message"]["content"] or "").strip()
-    except Exception:
-        return None
-    return final or None
+    return text
 
 
 def _is_unhelpful_runtime_answer(text: str) -> bool:
@@ -360,11 +268,7 @@ async def _final_spoken_with_k2_guarded(
     user_text: Optional[str] = None,
     mode: str = "visual answer",
 ) -> Optional[str]:
-    for _ in range(2):
-        final = await _final_spoken_with_k2(model_output, user_text=user_text, mode=mode)
-        if final and not _is_unhelpful_runtime_answer(final):
-            return final
-    return None
+    return await _final_spoken_with_k2(model_output, user_text=user_text, mode=mode)
 
 
 async def _run_seeingeye_frames_guarded(question: str, frames_b64: list[str]) -> str:
@@ -377,36 +281,8 @@ async def _run_seeingeye_frames_guarded(question: str, frames_b64: list[str]) ->
 
 
 async def _complete_with_k2(prompt: str, *, max_tokens: int = 900) -> Optional[str]:
-    if not _K2_API_KEY or not prompt.strip():
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                f"{_K2_BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {_K2_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": _K2_SUMMARIZER_MODEL,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You summarize long visual timelines for a blind user. "
-                                "Be specific, time-stamped, and safety-focused."
-                            ),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": max_tokens,
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-        return (data["choices"][0]["message"]["content"] or "").strip() or None
-    except Exception:
-        return None
+    _ = (prompt, max_tokens)
+    return None
 
 
 async def _repair_daily_video_segment_summary(
@@ -434,24 +310,12 @@ async def _repair_daily_video_segment_summary(
         "Why it is dangerous | Recommended next action.\n"
         "Do not include meta commentary, reasoning process, or comments about the format."
     )
-    fixed = (await _complete_with_k2(prompt, max_tokens=500) or "").strip()
-    if fixed and not _is_unhelpful_video_summary_text(fixed):
-        return fixed
+    _ = prompt
     return None
 
 
 async def _repair_daily_video_final_summary(final_prompt: str) -> Optional[str]:
-    fixed = (
-        await _complete_with_k2(
-            final_prompt
-            + "\n\nRewrite again in English only. Do not output answer letters, benchmark/test wording, "
-            "or prompt commentary. Keep the report readable and safety-focused.",
-            max_tokens=1200,
-        )
-        or ""
-    ).strip()
-    if fixed and not _is_unhelpful_video_summary_text(fixed):
-        return fixed
+    _ = final_prompt
     return None
 
 
@@ -1650,8 +1514,7 @@ async def root() -> FileResponse:
 async def health(response: Response) -> dict:
     probe = seeingeye_bridge.runtime_probe()
     openai_ready = bool(_OPENAI_API_KEY)
-    k2_ready = bool(_K2_API_KEY)
-    core_ready = probe.ok and openai_ready and k2_ready
+    core_ready = probe.ok and openai_ready
     if not core_ready:
         response.status_code = 503
 
@@ -1664,8 +1527,6 @@ async def health(response: Response) -> dict:
         issues.append("spaz_runtime_unavailable")
     if not openai_ready:
         issues.append("openai_api_key_missing")
-    if not k2_ready:
-        issues.append("k2_api_key_missing")
 
     return {
         "ok": core_ready,
@@ -1677,7 +1538,6 @@ async def health(response: Response) -> dict:
         "spaz_path": str(seeingeye_bridge.STATUS.root) if seeingeye_bridge.STATUS.root else None,
         "spaz_reason": probe.reason or seeingeye_bridge.STATUS.reason,
         "openai_ready": openai_ready,
-        "k2_ready": k2_ready,
         "elevenlabs": bool(_ELEVENLABS_KEY),
         "geocoding": bool(_GMAPS_KEY),
         "issues": issues,
